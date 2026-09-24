@@ -1,0 +1,20 @@
+name: build
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet build Il2CppDumper/Il2CppDumper.csproj -c Release -f net8.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Il2CppDumper-net8
+          path: Il2CppDumper/bin/Release/net8.0/

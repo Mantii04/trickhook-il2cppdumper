@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -94,7 +94,7 @@ namespace Il2CppDumper
                 Version = 24.1;
             }
             typeDefs = ReadMetadataClassArray<Il2CppTypeDefinition>(header.typeDefinitionsOffset, header.typeDefinitionsSize);
-            methodDefs = ReadMetadataClassArray<Il2CppMethodDefinition>(header.methodsOffset, header.methodsSize);
+            methodDefs = ReadMethodDefs();
             parameterDefs = ReadMetadataClassArray<Il2CppParameterDefinition>(header.parametersOffset, header.parametersSize);
             fieldDefs = ReadMetadataClassArray<Il2CppFieldDefinition>(header.fieldsOffset, header.fieldsSize);
             var fieldDefaultValues = ReadMetadataClassArray<Il2CppFieldDefaultValue>(header.fieldDefaultValuesOffset, header.fieldDefaultValuesSize);
@@ -160,6 +160,73 @@ namespace Il2CppDumper
         private T[] ReadMetadataClassArray<T>(uint addr, int count) where T : new()
         {
             return ReadClassArray<T>(addr, count / SizeOf(typeof(T)));
+        }
+
+        /// Le a tabela de metodos detectando layouts nao-padrao (ver FFMethodLayout).
+        private Il2CppMethodDefinition[] ReadMethodDefs()
+        {
+            var expected = SizeOf(typeof(Il2CppMethodDefinition));
+            var count = FFMethodLayout.CountFromTypeDefs(typeDefs);
+            if (count <= 0 || header.methodsSize <= 0 || header.methodsSize % count != 0)
+                return ReadMetadataClassArray<Il2CppMethodDefinition>(header.methodsOffset, header.methodsSize);
+
+            var stride = header.methodsSize / count;
+            if (stride == expected)
+                return ReadClassArray<Il2CppMethodDefinition>(header.methodsOffset, count);
+
+            var pad = stride - expected;
+            if (pad <= 0 || pad > FFMethodLayout.MaxPadding)
+            {
+                Console.WriteLine($"WARNING: Il2CppMethodDefinition is {stride} bytes, version {Version} expects {expected}. Using the standard layout; the dump may be wrong.");
+                return ReadMetadataClassArray<Il2CppMethodDefinition>(header.methodsOffset, header.methodsSize);
+            }
+
+            Position = header.methodsOffset;
+            var raw = ReadBytes(count * stride);
+            var owner = FFMethodLayout.BuildOwnerTable(typeDefs, count);
+            var parametersCount = header.parametersSize / SizeOf(typeof(Il2CppParameterDefinition));
+            var genericContainersCount = header.genericContainersSize / SizeOf(typeof(Il2CppGenericContainer));
+            var blocks = FFMethodLayout.SampleBlocks(count);
+
+            var bestOffset = -1;
+            var bestScore = 0.0;
+            foreach (var p in FFMethodLayout.CandidateOffsets(expected))
+            {
+                var sum = 0.0;
+                var n = 0;
+                foreach (var (start, len) in blocks)
+                {
+                    var slice = new byte[len * stride];
+                    Buffer.BlockCopy(raw, start * stride, slice, 0, len * stride);
+                    var parsed = ParseMethodDefs(FFMethodLayout.Repack(slice, len, stride, expected, p, pad), len);
+                    sum += FFMethodLayout.Score(parsed, start, owner, header.stringSize,
+                                                parametersCount, genericContainersCount);
+                    n++;
+                }
+                var score = n == 0 ? 0 : sum / n;
+                if (score > bestScore) { bestScore = score; bestOffset = p; }
+            }
+
+            if (bestOffset < 0 || bestScore < 0.95)
+            {
+                Console.WriteLine($"WARNING: Il2CppMethodDefinition is {stride} bytes, version {Version} expects {expected}, and the extra field could not be located (best confidence {bestScore:P1}). The dump will be wrong.");
+                return ReadMetadataClassArray<Il2CppMethodDefinition>(header.methodsOffset, header.methodsSize);
+            }
+
+            var layout = new FFMethodLayout.Layout
+            {
+                Count = count, Stride = stride, ExpectedSize = expected,
+                PadOffset = bestOffset, PadSize = pad, Confidence = bestScore,
+            };
+            Console.WriteLine($"Il2CppMethodDefinition layout: {layout}");
+            return ParseMethodDefs(FFMethodLayout.Repack(raw, count, stride, expected, bestOffset, pad), count);
+        }
+
+        private Il2CppMethodDefinition[] ParseMethodDefs(byte[] buffer, int count)
+        {
+            using var ms = new MemoryStream(buffer);
+            var bs = new BinaryStream(ms) { Version = Version, Is32Bit = Is32Bit };
+            return bs.ReadClassArray<Il2CppMethodDefinition>(0ul, (long)count);
         }
 
         public bool GetFieldDefaultValueFromIndex(int index, out Il2CppFieldDefaultValue value)

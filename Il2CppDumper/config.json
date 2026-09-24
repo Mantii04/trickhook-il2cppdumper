@@ -1,8 +1,8 @@
 {
   "DumpMethod": true,
   "DumpField": true,
-  "DumpProperty": true,
-  "DumpAttribute": true,
+  "DumpProperty": false,
+  "DumpAttribute": false,
   "DumpFieldOffset": true,
   "DumpMethodOffset": true,
   "DumpTypeDefIndex": true,
@@ -13,5 +13,7 @@
   "ForceIl2CppVersion": false,
   "ForceVersion": 16,
   "ForceDump": false,
-  "NoRedirectedPointer": false
+  "NoRedirectedPointer": false,
+  "ImageBase": "",
+  "UnpackProtected": true
 }

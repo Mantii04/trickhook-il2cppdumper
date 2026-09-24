@@ -1,4 +1,4 @@
-﻿namespace Il2CppDumper
+namespace Il2CppDumper
 {
     public class Config
     {
@@ -17,5 +17,10 @@
         public double ForceVersion { get; set; } = 24.3;
         public bool ForceDump { get; set; } = false;
         public bool NoRedirectedPointer { get; set; } = false;
+        /// Base de carga de um dump de memoria, em hex (ex "74e2814000").
+        /// Definir isso evita o prompt interativo.
+        public string ImageBase { get; set; } = "";
+        /// Desempacotar automaticamente .so protegidos (stub_decrypt_elf).
+        public bool UnpackProtected { get; set; } = true;
     }
 }

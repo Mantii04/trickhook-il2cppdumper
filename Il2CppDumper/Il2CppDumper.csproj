@@ -31,6 +31,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- sidecars da janela 0 (ver FF/FFWindow0Patch.cs) -->
+    <None Include="../ffpatches/*.w0" LinkBase="ffpatches">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <None Update="config.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

@@ -361,3 +361,16 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# --- fork ---
+# saidas do dumper
+out/
+dump.cs
+il2cpp.h
+script.json
+stringliteral.json
+DummyDll/
+# amostras (libil2cpp.so, global-metadata.dat, apks) nao vao pro repo
+*.so
+*.dat
+*.apk
+*.xapk

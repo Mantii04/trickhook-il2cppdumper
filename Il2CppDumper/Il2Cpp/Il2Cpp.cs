@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -225,13 +225,29 @@ namespace Il2CppDumper
                     rgctxsDictionary.Add(moduleName, rgctxsDefDictionary);
                     if (codeGenModule.rgctxsCount > 0)
                     {
+                        // Num .so ainda empacotado essas tabelas caem em bytes
+                        // cifrados e range.start vem negativo. Pular a entrada e
+                        // avisar e melhor do que estourar o processo inteiro.
                         var rgctxs = MapVATR<Il2CppRGCTXDefinition>(codeGenModule.rgctxs, codeGenModule.rgctxsCount);
                         var rgctxRanges = MapVATR<Il2CppTokenRangePair>(codeGenModule.rgctxRanges, codeGenModule.rgctxRangesCount);
+                        var badRanges = 0;
                         foreach (var rgctxRange in rgctxRanges)
                         {
-                            var rgctxDefs = new Il2CppRGCTXDefinition[rgctxRange.range.length];
-                            Array.Copy(rgctxs, rgctxRange.range.start, rgctxDefs, 0, rgctxRange.range.length);
-                            rgctxsDefDictionary.Add(rgctxRange.token, rgctxDefs);
+                            var start = rgctxRange.range.start;
+                            var length = rgctxRange.range.length;
+                            if (start < 0 || length < 0 || (long)start + length > rgctxs.Length)
+                            {
+                                badRanges++;
+                                continue;
+                            }
+                            var rgctxDefs = new Il2CppRGCTXDefinition[length];
+                            Array.Copy(rgctxs, start, rgctxDefs, 0, length);
+                            rgctxsDefDictionary[rgctxRange.token] = rgctxDefs;
+                        }
+                        if (badRanges > 0)
+                        {
+                            Console.WriteLine($"WARNING: {moduleName}: skipped {badRanges}/{rgctxRanges.Length} corrupt RGCTX ranges. " +
+                                              "The binary is probably still packed - dump it from memory (tools/ffdump.py).");
                         }
                     }
                 }
@@ -242,8 +258,15 @@ namespace Il2CppDumper
             }
             genericMethodTable = MapVATR<Il2CppGenericMethodFunctionsDefinitions>(pMetadataRegistration.genericMethodTable, pMetadataRegistration.genericMethodTableCount);
             methodSpecs = MapVATR<Il2CppMethodSpec>(pMetadataRegistration.methodSpecs, pMetadataRegistration.methodSpecsCount);
+            var badGeneric = 0;
             foreach (var table in genericMethodTable)
             {
+                if (table.genericMethodIndex < 0 || table.genericMethodIndex >= methodSpecs.Length ||
+                    table.indices.methodIndex < 0 || table.indices.methodIndex >= genericMethodPointers.Length)
+                {
+                    badGeneric++;
+                    continue;
+                }
                 var methodSpec = methodSpecs[table.genericMethodIndex];
                 var methodDefinitionIndex = methodSpec.methodDefinitionIndex;
                 if (!methodDefinitionMethodSpecs.TryGetValue(methodDefinitionIndex, out var list))
@@ -252,7 +275,12 @@ namespace Il2CppDumper
                     methodDefinitionMethodSpecs.Add(methodDefinitionIndex, list);
                 }
                 list.Add(methodSpec);
-                methodSpecGenericMethodPointers.Add(methodSpec, genericMethodPointers[table.indices.methodIndex]);
+                methodSpecGenericMethodPointers[methodSpec] = genericMethodPointers[table.indices.methodIndex];
+            }
+            if (badGeneric > 0)
+            {
+                Console.WriteLine($"WARNING: skipped {badGeneric}/{genericMethodTable.Length} corrupt generic method table entries. " +
+                                  "The binary is probably still packed - dump it from memory (tools/ffdump.py).");
             }
         }
 

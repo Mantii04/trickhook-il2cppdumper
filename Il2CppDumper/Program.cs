@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -125,6 +125,9 @@ namespace Il2CppDumper
 
             Console.WriteLine("Initializing il2cpp file...");
             var il2cppBytes = File.ReadAllBytes(il2cppPath);
+            var unpack = FFProtector.TryUnpack(il2cppBytes, config.UnpackProtected, il2cppPath);
+            FFProtector.Report(unpack);
+            il2cppBytes = unpack.Data;
             var il2cppMagic = BitConverter.ToUInt32(il2cppBytes, 0);
             var il2CppMemory = new MemoryStream(il2cppBytes);
             switch (il2cppMagic)
@@ -186,8 +189,17 @@ namespace Il2CppDumper
                 if (il2Cpp is ElfBase elf)
                 {
                     Console.WriteLine("Detected this may be a dump file.");
-                    Console.WriteLine("Input il2cpp dump address or input 0 to force continue:");
-                    var DumpAddr = Convert.ToUInt64(Console.ReadLine(), 16);
+                    ulong DumpAddr;
+                    if (!string.IsNullOrWhiteSpace(config.ImageBase))
+                    {
+                        DumpAddr = Convert.ToUInt64(config.ImageBase.Trim().Replace("0x", ""), 16);
+                        Console.WriteLine($"Using ImageBase from config.json: 0x{DumpAddr:x}");
+                    }
+                    else
+                    {
+                        Console.WriteLine("Input il2cpp dump address or input 0 to force continue:");
+                        DumpAddr = Convert.ToUInt64(Console.ReadLine(), 16);
+                    }
                     if (DumpAddr != 0)
                     {
                         il2Cpp.ImageBase = DumpAddr;
