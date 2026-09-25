@@ -144,6 +144,36 @@ std::string Il2CppBinary::readCStrAt(size_t normOffset) const {
     return std::string(p, strnlen(p, max));
 }
 
+uint64_t Il2CppBinary::readPtr(uint64_t runtimeAddr) const {
+    size_t off = runtimeToOffset(runtimeAddr);
+    if (off == SIZE_MAX) return 0;
+    return readQwordAt(off);
+}
+
+uint32_t Il2CppBinary::readU32(uint64_t runtimeAddr) const {
+    size_t off = runtimeToOffset(runtimeAddr);
+    if (off == SIZE_MAX) return 0;
+    return (uint32_t)readQwordAt(off);
+}
+
+uint16_t Il2CppBinary::readU16(uint64_t runtimeAddr) const {
+    size_t off = runtimeToOffset(runtimeAddr);
+    if (off == SIZE_MAX) return 0;
+    return readU16At(off);
+}
+
+int32_t Il2CppBinary::readI32(uint64_t runtimeAddr) const {
+    size_t off = runtimeToOffset(runtimeAddr);
+    if (off == SIZE_MAX) return 0;
+    return readI32At(off);
+}
+
+std::string Il2CppBinary::readCStr(uint64_t runtimeAddr) const {
+    size_t off = runtimeToOffset(runtimeAddr);
+    if (off == SIZE_MAX) return "";
+    return readCStrAt(off);
+}
+
 size_t Il2CppBinary::runtimeToOffset(uint64_t runtimeAddr) const {
     if (runtimeAddr < base_) return SIZE_MAX;
     uint64_t off = runtimeAddr - base_;

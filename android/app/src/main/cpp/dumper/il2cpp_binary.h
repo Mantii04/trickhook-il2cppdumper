@@ -61,6 +61,13 @@ public:
     uint64_t methodPointer(const std::string& imageName, uint32_t token) const;
 
     uint64_t readQwordAt(size_t normOffset) const;
+
+    // runtime-address variants (translate via runtimeToOffset then read)
+    uint64_t readPtr(uint64_t runtimeAddr) const;
+    uint32_t readU32(uint64_t runtimeAddr) const;
+    uint16_t readU16(uint64_t runtimeAddr) const;
+    int32_t  readI32(uint64_t runtimeAddr) const;
+    std::string readCStr(uint64_t runtimeAddr) const;
     int32_t  readI32At(size_t normOffset) const;
     uint16_t readU16At(size_t normOffset) const;
     std::string readCStrAt(size_t normOffset) const;
