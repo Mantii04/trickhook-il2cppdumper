@@ -10,8 +10,10 @@ add_library(il2cppdumper SHARED
     dumper/ff_protector.cpp
     dumper/metadata.cpp
     dumper/output_writer.cpp
+    dumper/il2cpp_binary.cpp
+    dumper/type_resolver.cpp
     dumper/aes.c
 )
 
-target_compile_options(il2cppdumper PRIVATE -O2 -fno-exceptions -fno-rtti -Wall -Wextra)
+target_compile_options(il2cppdumper PRIVATE -O2 -fno-exceptions -fno-rtti -Wall)
 target_link_libraries(il2cppdumper PRIVATE log android)
