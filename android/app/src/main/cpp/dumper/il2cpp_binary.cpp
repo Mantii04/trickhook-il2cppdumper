@@ -1,6 +1,8 @@
 #include "il2cpp_binary.h"
 #include "metadata.h"
 #include <cstdio>
+#include <cstring>
+#include <map>
 #include <fstream>
 
 bool Il2CppBinary::load(const std::string& path, const LogFn& log) {

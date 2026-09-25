@@ -1,4 +1,5 @@
 #include "type_resolver.h"
+#include <map>
 #include "metadata.h"
 
 // Il2CppTypeEnum values

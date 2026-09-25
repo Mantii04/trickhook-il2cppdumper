@@ -1,5 +1,7 @@
 #include "output_writer.h"
 #include <cstdio>
+#include <vector>
+#include <string>
 
 // ---- constants ----
 
