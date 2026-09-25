@@ -173,11 +173,13 @@ static bool match_mr_at(const std::vector<uint8_t>& data, size_t off, MrPattern&
     c[4] = rq(off + 0x40); p[4] = rq(off + 0x48);
     c[5] = rq(off + 0x50); p[5] = rq(off + 0x58);
     c[6] = rq(off + 0x60); p[6] = rq(off + 0x68);
-    // all pointers must be in the 0x7_0000_0000+ range
-    for (int i = 0; i < 7; i++) if (p[i] < 0x7000000000ull) return false;
-    // all counts must be plausible
-    for (int i = 0; i < 7; i++) if (c[i] < 100 || c[i] > 5000000) return false;
-    // typesCount should be reasonably large
+    // counts must all be in plausible range
+    for (int i = 0; i < 7; i++) if (c[i] < 1000 || c[i] > 500000) return false;
+    // pointers must all be in same 2^40 bucket (top 24 bits equal)
+    uint64_t top = p[0] >> 40;
+    if (top < 0x70 || top > 0x7F) return false;
+    for (int i = 1; i < 7; i++) if ((p[i] >> 40) != top) return false;
+    // typesCount must be largest or second-largest (it is for MR)
     if (c[3] < 10000 || c[3] > 500000) return false;
     out.fileOff = off;
     out.gcCount = c[0]; out.gcPtr = p[0];
@@ -211,51 +213,56 @@ uint64_t Il2CppBinary::autoDetectY(const LogFn& log) {
         char b[128]; snprintf(b, sizeof(b), "  autoDetectY: found %zu MR candidates", cands.size());
         log(b);
     }
-    // Prefer the candidate with the largest pointers (runtime copy)
-    size_t best = 0;
-    for (size_t k = 1; k < cands.size(); k++)
-        if (cands[k].tPtr > cands[best].tPtr) best = k;
-    auto& mr = cands[best];
-
-    uint64_t minP = mr.tPtr;
-    uint64_t maxP = mr.tPtr;
-    uint64_t allP[] = { mr.gcPtr, mr.giPtr, mr.mtPtr, mr.tPtr, mr.msPtr, mr.foPtr, mr.tdsPtr };
-    for (uint64_t v : allP) { if (v < minP) minP = v; if (v > maxP) maxP = v; }
 
     uint64_t file_size = data_.size();
-    uint64_t lo = (maxP > file_size) ? (maxP - file_size) : 0;
-    lo = (lo + 0xFFFull) & ~0xFFFull;
-    uint64_t hi = minP & ~0xFFFull;
-    if (lo > hi) { log("  autoDetectY: no valid Y range"); return 0; }
+    for (size_t k = 0; k < cands.size(); k++) {
+        auto& mr = cands[k];
+        uint64_t allP[] = { mr.gcPtr, mr.giPtr, mr.mtPtr, mr.tPtr, mr.msPtr, mr.foPtr, mr.tdsPtr };
+        uint64_t mn = allP[0], mx = allP[0];
+        for (auto v : allP) { if (v < mn) mn = v; if (v > mx) mx = v; }
+        if (mx - mn >= file_size) continue;
 
-    {
-        char b[160]; snprintf(b, sizeof(b), "  autoDetectY: Y in [0x%llx, 0x%llx]",
-                             (unsigned long long)lo, (unsigned long long)hi);
-        log(b);
-    }
+        uint64_t lo = (mx >= file_size) ? (mx - file_size) : 0;
+        lo = (lo + 0xFFFull) & ~0xFFFull;
+        uint64_t hi = mn & ~0xFFFull;
+        if (lo > hi) continue;
 
-    // Try each page-aligned Y
-    for (uint64_t Y = lo; Y <= hi; Y += 0x1000) {
-        if (mr.tPtr < Y) continue;
-        size_t toff = (size_t)(mr.tPtr - Y);
-        if (toff + 32 > file_size) continue;
-        uint64_t q0 = readQwordAt(toff);
-        uint64_t q1 = readQwordAt(toff + 8);
-        if (q0 < Y || q0 >= Y + file_size) continue;
-        if (q1 < Y || q1 >= Y + file_size) continue;
-        // q1 - q0 should equal Il2CppType size (0x10 on arm64)
-        if (q1 - q0 != 0x10) continue;
-        // verify q0's target has plausible bits
-        size_t t0off = (size_t)(q0 - Y);
-        if (t0off + 16 > file_size) continue;
-        uint32_t bits = (uint32_t)readQwordAt(t0off + 8);
-        uint8_t te = (bits >> 16) & 0xFF;
-        // Il2CppTypeEnum is 0x00..0x22 or 0x55 (ENUM) or 0xFF
-        bool okEnum = (te <= 0x22) || (te == 0x55) || (te == 0xFF);
-        if (!okEnum) continue;
-        return Y;
+        // sample Y candidates: first try hi (max Y = min pointer), then midpoints
+        uint64_t range = hi - lo;
+        uint64_t step = range / 64;
+        if (step < 0x1000) step = 0x1000;
+
+        int tried = 0;
+        for (uint64_t Y = lo; Y <= hi && tried < 128; Y += step, tried++) {
+            if (mr.tPtr < Y) continue;
+            size_t toff = (size_t)(mr.tPtr - Y);
+            if (toff + 0x20 > file_size) continue;
+            uint64_t q0 = readQwordAt(toff);
+            uint64_t q1 = readQwordAt(toff + 8);
+            if (q0 < Y || q0 >= Y + file_size) continue;
+            if (q1 < Y || q1 >= Y + file_size) continue;
+            if (q1 - q0 != 0x10) continue;
+            size_t t0off = (size_t)(q0 - Y);
+            if (t0off + 16 > file_size) continue;
+            uint32_t bits = (uint32_t)readQwordAt(t0off + 8);
+            uint8_t te = (bits >> 16) & 0xFF;
+            bool okEnum = (te <= 0x22) || (te == 0x55) || (te == 0xFF);
+            if (!okEnum) continue;
+            // extra: second type must also be valid
+            uint64_t q2 = readQwordAt(toff + 0x10);
+            if (q2 < Y || q2 >= Y + file_size) continue;
+            if (q2 - q1 != 0x10) continue;
+            metaRegFileOff_ = mr.fileOff;
+            {
+                char b[200]; snprintf(b, sizeof(b),
+                    "  autoDetectY: hit at candidate %zu, Y=0x%llx, MR file=0x%zx",
+                    k, (unsigned long long)Y, mr.fileOff);
+                log(b);
+            }
+            return Y;
+        }
     }
-    log("  autoDetectY: no Y satisfied type array validation");
+    log("  autoDetectY: no Y satisfied validation");
     return 0;
 }
 
@@ -265,49 +272,33 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
     (void)md;
     char b[256];
 
-    // locate runtime MR by signature
-    std::vector<MrPattern> cands;
-    size_t i = 0;
-    while (i + 0x70 <= data_.size()) {
-        MrPattern p{};
-        if (match_mr_at(data_, i, p)) cands.push_back(p);
-        i += 8;
-    }
-    if (cands.empty()) {
-        log("  ERROR: no runtime MR found");
+    if (metaRegFileOff_ == 0) {
+        log("  ERROR: no MR location recorded by autoDetectY");
         return false;
     }
 
-    // pick candidate whose pointers land in [base_, base_ + file_size)
-    MrPattern* chosen = nullptr;
-    for (auto& c : cands) {
-        uint64_t tp = c.tPtr - base_;
-        if (tp >= data_.size()) continue;
-        uint64_t q0 = readQwordAt((size_t)tp);
-        if (q0 < base_ || q0 >= base_ + data_.size()) continue;
-        chosen = &c;
-        break;
-    }
-    if (!chosen) {
-        log("  ERROR: no MR candidate matches base");
-        return false;
-    }
+    // read the MR fields at that file offset
+    uint64_t gcCount = readQwordAt(metaRegFileOff_ + 0x00);
+    uint64_t giCount = readQwordAt(metaRegFileOff_ + 0x10);
+    uint64_t mtCount = readQwordAt(metaRegFileOff_ + 0x20);
+    uint64_t tCount  = readQwordAt(metaRegFileOff_ + 0x30);
+    uint64_t msCount = readQwordAt(metaRegFileOff_ + 0x40);
 
-    metaRegAddr_ = base_ + chosen->fileOff;
+    metaRegAddr_ = base_ + metaRegFileOff_;
     diag_.metaReg = metaRegAddr_;
-    diag_.typeCount = chosen->tCount;
-    diag_.genericInstsCount = chosen->giCount;
-    diag_.methodSpecsCount = chosen->msCount;
+    diag_.typeCount = tCount;
+    diag_.genericInstsCount = giCount;
+    diag_.methodSpecsCount = msCount;
 
     snprintf(b, sizeof(b),
         "  MetadataRegistration @ file 0x%zx (runtime 0x%llx): typesCount=%llu genericInstsCount=%llu methodSpecsCount=%llu",
-        chosen->fileOff, (unsigned long long)metaRegAddr_,
-        (unsigned long long)chosen->tCount,
-        (unsigned long long)chosen->giCount,
-        (unsigned long long)chosen->msCount);
+        metaRegFileOff_, (unsigned long long)metaRegAddr_,
+        (unsigned long long)tCount,
+        (unsigned long long)giCount,
+        (unsigned long long)msCount);
     log(b);
+    (void)gcCount; (void)mtCount;
 
-    // CodeRegistration: not located. script.json addresses will be empty.
     log("  CodeRegistration: not located (method addresses will be omitted)");
     return true;
 }

@@ -98,6 +98,7 @@ private:
     uint64_t base_ = 0;
     Diag diag_;
 
+    size_t   metaRegFileOff_ = 0;
     uint64_t codeRegAddr_ = 0;
     uint64_t metaRegAddr_ = 0;
 
