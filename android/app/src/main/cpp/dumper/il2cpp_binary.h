@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+struct Metadata;
+
 // v31 il2cpp runtime layouts (arm64)
 struct Il2CppType {
     uint64_t datapoint;
