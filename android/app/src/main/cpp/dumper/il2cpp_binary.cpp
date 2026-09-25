@@ -29,10 +29,16 @@ bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
 }
 
 uint64_t Il2CppBinary::mapVaddrToOffset(uint64_t vaddr) const {
-    // Memory dump: file offset == vaddr (identity mapping).
-    // The dump tool writes loaded bytes sequentially from the base of the
-    // mapped image, so the byte at file offset X is the byte at vaddr X.
-    return vaddr;
+    // The dump preserves the on-disk ELF layout: section file offsets
+    // differ from vaddrs for .text/.plt/.data.rel.ro. Use the section
+    // table to translate.
+    for (auto& s : elf_.sections) {
+        if (s.sh_size == 0) continue;
+        if (vaddr >= s.sh_addr && vaddr < s.sh_addr + s.sh_size) {
+            return vaddr - s.sh_addr + s.sh_offset;
+        }
+    }
+    return vaddr;  // fallback for vaddrs outside any section
 }
 
 bool Il2CppBinary::isInRange(uint64_t vaddr, size_t len) const {
@@ -163,6 +169,15 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
     }
     if (textStart == 0) { log("  no .text section"); return false; }
 
+    // Log sections being scanned
+    for (auto* s : dataSections) {
+        char b[160];
+        snprintf(b, sizeof(b), "  scanning section %s addr=0x%llx off=0x%llx size=0x%llx",
+                 s->name.c_str(), (unsigned long long)s->sh_addr,
+                 (unsigned long long)s->sh_offset, (unsigned long long)s->sh_size);
+        log(b);
+    }
+
     // Search for CodeRegistration: find a struct where:
     //   - codeGenModulesCount between 1 and 2000
     //   - codeGenModules points into a data section
@@ -178,39 +193,50 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
 
     size_t codeRegCandidates = 0;
     size_t metaRegCandidates = 0;
+    size_t nearMisses = 0;
 
     for (auto* sec : dataSections) {
         size_t count = sec->sh_size / 8;
         for (size_t i = 0; i + 18 <= count; i++) {
-            uint64_t addr = sec->sh_addr + i * 8;
-            // Try as CodeRegistration at various alignments
-            for (int shift = 0; shift <= 8; shift += 8) {
-                uint64_t base = addr + shift;
-                uint64_t gmpCount  = readPtr(base + 0x10);
-                uint64_t gmp       = readPtr(base + 0x18);
-                uint64_t cgmCount  = readPtr(base + 0x78);
-                uint64_t cgm       = readPtr(base + 0x80);
+            uint64_t base = sec->sh_addr + i * 8;
+            uint64_t gmpCount  = readPtr(base + 0x10);
+            uint64_t gmp       = readPtr(base + 0x18);
+            uint64_t cgmCount  = readPtr(base + 0x78);
+            uint64_t cgm       = readPtr(base + 0x80);
 
-                if (cgmCount == 0 || cgmCount > 2000) continue;
-                if (!plausibleData(cgm)) continue;
-                if (gmpCount > 500000) continue;
-                if (gmpCount > 0 && !plausibleData(gmp)) continue;
-
-                // extra validation: first codeGenModule should point to a valid C string
-                uint64_t firstMod = readPtr(cgm);
-                std::string name = readCStr(firstMod);
-                if (name.size() < 4 || name.find(".dll") == std::string::npos) continue;
-
-                diag_.codeReg = base;
-                diag_.codeGenModulesCount = cgmCount;
-                diag_.methodPointerCount = gmpCount;
-                codeRegCandidates++;
-                char b[160];
-                snprintf(b, sizeof(b),
-                    "  CodeRegistration @ 0x%llx: codeGenModulesCount=%llu, first module=%s",
-                    (unsigned long long)base, (unsigned long long)cgmCount, name.c_str());
-                log(b);
-                break;
+            // Log plausible candidates even if they fail strict validation
+            if (cgmCount > 0 && cgmCount < 5000 && gmpCount < 500000) {
+                bool cgmOk = plausibleData(cgm);
+                bool gmpOk = (gmpCount == 0) || plausibleData(gmp);
+                std::string name;
+                if (cgmOk) {
+                    uint64_t firstMod = readPtr(cgm);
+                    name = readCStr(firstMod);
+                }
+                if (cgmOk && gmpOk && !name.empty() && name.find(".dll") != std::string::npos) {
+                    diag_.codeReg = base;
+                    diag_.codeGenModulesCount = cgmCount;
+                    diag_.methodPointerCount = gmpCount;
+                    codeRegCandidates++;
+                    char b[200];
+                    snprintf(b, sizeof(b),
+                        "  CodeRegistration @ 0x%llx: codeGenModulesCount=%llu, first module=%s",
+                        (unsigned long long)base, (unsigned long long)cgmCount, name.c_str());
+                    log(b);
+                } else {
+                    // log a handful of near misses so we can see what the scan is seeing
+                    if (nearMisses < 5) {
+                        char b[220];
+                        snprintf(b, sizeof(b),
+                            "  [near-miss] @ 0x%llx cgmCount=%llu cgmOk=%d gmpCount=%llu gmpOk=%d name='%s'",
+                            (unsigned long long)base,
+                            (unsigned long long)cgmCount, cgmOk ? 1 : 0,
+                            (unsigned long long)gmpCount, gmpOk ? 1 : 0,
+                            name.substr(0, 32).c_str());
+                        log(b);
+                        nearMisses++;
+                    }
+                }
             }
             if (diag_.codeReg) break;
         }
