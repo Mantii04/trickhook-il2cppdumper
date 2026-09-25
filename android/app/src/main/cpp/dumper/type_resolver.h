@@ -1,9 +1,7 @@
 #pragma once
 #include "common.h"
 #include "il2cpp_binary.h"
-
-struct Metadata;
-struct Il2CppTypeDefinition;
+#include "metadata.h"
 
 class TypeResolver {
 public:

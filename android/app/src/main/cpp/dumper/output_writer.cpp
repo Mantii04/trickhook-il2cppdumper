@@ -107,8 +107,19 @@ int write_dump_cs(const Metadata& m, const Il2CppBinary& bin, const std::string&
     size_t totalTypes = m.typeDefs.size();
     log("writing dump.cs (" + std::to_string(totalTypes) + " types)...");
 
+    // Map each typedef index -> owning image name (for methodPointer lookup)
+    std::vector<std::string> typedefImage(totalTypes);
+    for (const auto& img : m.imageDefs) {
+        int end = img.typeStart + (int)img.typeCount;
+        std::string imgName = m.read_string(img.nameIndex);
+        for (int t = img.typeStart; t < end && (size_t)t < totalTypes; t++) {
+            typedefImage[t] = imgName;
+        }
+    }
+
     for (size_t typeIdx = 0; typeIdx < totalTypes; typeIdx++) {
         const auto& td = m.typeDefs[typeIdx];
+        const std::string& imgName = typedefImage[typeIdx];
 
         // extends: parent + interfaces
         std::vector<std::string> extends;
@@ -241,10 +252,8 @@ int write_dump_cs(const Metadata& m, const Il2CppBinary& bin, const std::string&
                 const auto& md = m.methodDefs[mi];
                 if ((size_t)md.returnType >= bin.types().size()) continue;
 
-                // RVA
-                uint64_t methodPtr = bin.methodPointer(
-                    m.read_string(m.imageDefs.empty() ? 0 : 0), md.token);  // imageName lookup below
-                // We'll do proper image lookup later; write -1 for now
+                // RVA from per-image method pointer table
+                uint64_t methodPtr = bin.methodPointer(imgName, md.token);
                 fprintf(f, "\n");
                 if (md.flags & METHOD_ATTRIBUTE_ABSTRACT || methodPtr == 0) {
                     fprintf(f, "\t// RVA: -1 Offset: -1");

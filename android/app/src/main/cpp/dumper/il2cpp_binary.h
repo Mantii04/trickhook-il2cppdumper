@@ -1,6 +1,9 @@
 #pragma once
 #include "common.h"
 #include "elf_parser.h"
+#include <map>
+#include <string>
+#include <vector>
 
 // v31 il2cpp runtime layouts (arm64)
 struct Il2CppType {
