@@ -49,6 +49,7 @@ public:
     Il2CppBinary() = default;
 
     bool load(const std::string& path, const LogFn& log);
+    uint64_t autoDetectY(const LogFn& log);
     bool findRegistrations(const Metadata& md, const LogFn& log);
     bool parseRegistrations(const Metadata& md, const LogFn& log);
 
