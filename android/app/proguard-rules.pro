@@ -1,0 +1,1 @@
+-keep class com.mantii04.il2cppdumper.NativeBridge { *; }
