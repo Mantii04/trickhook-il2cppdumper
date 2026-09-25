@@ -47,9 +47,9 @@ bool ff_unpack(ElfInfo& elf, std::vector<uint8_t>& buf, const LogFn& log) {
     size_t desc_off = SIZE_MAX;
     size_t best_size = 0;
     size_t hits = 0;
-    for (size_t i = 0; i + 0x200 <= size; i += 4) {
+    for (size_t i = 0; i + 0x200 <= size; i++) {
         uint32_t m; std::memcpy(&m, data + i, 4);
-        if (m != 0x12345678u) continue;
+        if (m != 0x12345678u && m != 0x78563412u) continue;
         hits++;
         const char* nm = (const char*)(data + i + 4);
         if (nm[0] != '.') continue;

@@ -61,6 +61,20 @@ int run_dump(const std::string& so_path,
             snprintf(b, sizeof(b), "    idx=%d -> '%s'", idx, s.c_str());
             log(b);
         }
+        log("  raw hex of first 4 method structs (40 bytes each):");
+        for (int mi = 0; mi < 4; mi++) {
+            size_t base = (size_t)md.header.methodsOffset + (size_t)mi * md.method_stride;
+            if (base + md.method_stride > meta.size()) break;
+            const uint8_t* p = meta.data() + base;
+            char line[256]; int off = 0;
+            off += snprintf(line + off, sizeof(line) - off, "    m[%d] ", mi);
+            for (size_t k = 0; k < md.method_stride; k++) {
+                off += snprintf(line + off, sizeof(line) - off, "%02x", p[k]);
+                if (k % 4 == 3) off += snprintf(line + off, sizeof(line) - off, " ");
+            }
+            log(line);
+        }
+
         log("  first 8 methods (nameIdx, declType, token, flags, pcount):");
         for (int i = 0; i < 8; i++) {
             size_t off = (size_t)md.header.methodsOffset + (size_t)i * md.method_stride;

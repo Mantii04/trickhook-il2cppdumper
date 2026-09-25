@@ -4,6 +4,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -170,7 +172,7 @@ fun DumperScreen() {
                 }
             }
 
-            Box(
+            Column(
                 Modifier
                     .fillMaxWidth()
                     .weight(1f)
@@ -179,6 +181,30 @@ fun DumperScreen() {
                         RoundedCornerShape(16.dp)
                     )
             ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 12.dp, top = 6.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "log",
+                        color = Color(0xFF64748B),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 10.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = {
+                        val cb = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cb.setPrimaryClip(ClipData.newPlainText("log", log))
+                        Toast.makeText(ctx, "log copied", Toast.LENGTH_SHORT).show()
+                    }) {
+                        Icon(
+                            Icons.Default.ContentCopy,
+                            contentDescription = "copy log",
+                            tint = Color(0xFF7DD3FC),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
                 Text(
                     text = log,
                     color = Color(0xFF7DD3FC),
@@ -187,7 +213,7 @@ fun DumperScreen() {
                     modifier = Modifier
                         .fillMaxSize()
                         .verticalScroll(scroll)
-                        .padding(12.dp)
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
                 )
             }
         }
