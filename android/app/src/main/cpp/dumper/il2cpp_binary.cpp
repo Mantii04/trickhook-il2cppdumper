@@ -175,11 +175,12 @@ static bool match_mr_at(const std::vector<uint8_t>& data, size_t off, MrPattern&
     c[6] = rq(off + 0x60); p[6] = rq(off + 0x68);
     // counts must all be in plausible range
     for (int i = 0; i < 7; i++) if (c[i] < 1000 || c[i] > 500000) return false;
-    // pointers must all be in same 2^40 bucket (top 24 bits equal)
-    uint64_t top = p[0] >> 40;
-    if (top < 0x70 || top > 0x7F) return false;
-    for (int i = 1; i < 7; i++) if ((p[i] >> 40) != top) return false;
-    // typesCount must be largest or second-largest (it is for MR)
+    // pointers must all share the top byte (same 2^56 region, e.g. all 0x75...)
+    uint64_t top = p[0] >> 56;
+    if (top < 0x60 || top > 0x7F) return false;
+    for (int i = 1; i < 7; i++) if ((p[i] >> 56) != top) return false;
+    // typesCount must be the largest count (largest type table in il2cpp)
+    for (int i = 0; i < 7; i++) if (i != 3 && c[i] > c[3]) return false;
     if (c[3] < 10000 || c[3] > 500000) return false;
     out.fileOff = off;
     out.gcCount = c[0]; out.gcPtr = p[0];
