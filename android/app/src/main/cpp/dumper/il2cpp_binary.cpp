@@ -22,30 +22,17 @@ bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
     if (!elf_.valid) { log("not a valid ELF"); return false; }
     log("  parsed ELF, " + std::to_string(elf_.sections.size()) + " sections");
 
-    // image base: min vaddr of PT_LOAD with vaddr != 0
-    for (auto& s : elf_.sections) {
-        if (s.sh_addr != 0 && s.sh_size > 0) {
-            if (imageBase_ == 0 || s.sh_addr < imageBase_) imageBase_ = s.sh_addr;
-        }
-    }
-    log("  imageBase = 0x" + [&]{ char b[32]; snprintf(b,sizeof(b),"%llx",(unsigned long long)imageBase_); return std::string(b); }());
+    // Memory dump layout: vaddr space starts at 0. RVA == vaddr.
+    imageBase_ = 0;
 
     return true;
 }
 
 uint64_t Il2CppBinary::mapVaddrToOffset(uint64_t vaddr) const {
-    // In the memory-dumped .so, VA -> file offset is:
-    //   find a section whose [sh_addr, sh_addr + sh_size) contains vaddr
-    //   offset = vaddr - sh_addr + sh_offset
-    // ELF sections in this dump have sh_addr != sh_offset for .text and .plt
-    // (page alignment), so we must use section mapping, not identity.
-    for (auto& s : elf_.sections) {
-        if (s.sh_size == 0) continue;
-        if (vaddr >= s.sh_addr && vaddr < s.sh_addr + s.sh_size) {
-            return vaddr - s.sh_addr + s.sh_offset;
-        }
-    }
-    return vaddr;  // fallback
+    // Memory dump: file offset == vaddr (identity mapping).
+    // The dump tool writes loaded bytes sequentially from the base of the
+    // mapped image, so the byte at file offset X is the byte at vaddr X.
+    return vaddr;
 }
 
 bool Il2CppBinary::isInRange(uint64_t vaddr, size_t len) const {
@@ -163,7 +150,7 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
     for (auto& s : elf_.sections) {
         if (s.sh_size < 64) continue;
         if (s.name == ".data" || s.name == ".data.rel.ro" ||
-            s.name == ".bss" || s.name == ".got" ||
+            s.name == ".bss" || s.name == ".got" || s.name == ".got.plt" ||
             s.name.find(".data") == 0) {
             dataSections.push_back(&s);
         }
@@ -201,8 +188,8 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
                 uint64_t base = addr + shift;
                 uint64_t gmpCount  = readPtr(base + 0x10);
                 uint64_t gmp       = readPtr(base + 0x18);
-                uint64_t cgmCount  = readPtr(base + 0x70);
-                uint64_t cgm       = readPtr(base + 0x78);
+                uint64_t cgmCount  = readPtr(base + 0x78);
+                uint64_t cgm       = readPtr(base + 0x80);
 
                 if (cgmCount == 0 || cgmCount > 2000) continue;
                 if (!plausibleData(cgm)) continue;
@@ -244,8 +231,8 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
             uint64_t addr = sec->sh_addr + i * 8;
             int64_t  typesCount = (int64_t)readPtr(addr + 0x30);
             uint64_t types      = readPtr(addr + 0x38);
-            int64_t  giCount    = (int64_t)readPtr(addr + 0x18);
-            uint64_t gi         = readPtr(addr + 0x20);
+            int64_t  giCount    = (int64_t)readPtr(addr + 0x10);
+            uint64_t gi         = readPtr(addr + 0x18);
 
             if (typesCount < 1000 || typesCount > 500000) continue;
             if (!plausibleData(types)) continue;
@@ -286,8 +273,8 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     // ---- MetadataRegistration ----
     metadataRegistrationTypes_          = readPtr(metaRegAddr_ + 0x38);
     metadataRegistrationTypesCount_     = readPtr(metaRegAddr_ + 0x30);
-    metadataRegistrationGenericInsts_   = readPtr(metaRegAddr_ + 0x20);
-    metadataRegistrationGenericInstsCount_ = readPtr(metaRegAddr_ + 0x18);
+    metadataRegistrationGenericInsts_   = readPtr(metaRegAddr_ + 0x18);
+    metadataRegistrationGenericInstsCount_ = readPtr(metaRegAddr_ + 0x10);
     metadataRegistrationMethodSpecs_    = readPtr(metaRegAddr_ + 0x48);
     metadataRegistrationMethodSpecsCount_ = readPtr(metaRegAddr_ + 0x40);
 
@@ -333,8 +320,8 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     log("  " + std::to_string(methodSpecs_.size()) + " methodSpecs");
 
     // ---- CodeRegistration ----
-    uint64_t cgmCount = readPtr(codeRegAddr_ + 0x70);
-    uint64_t cgmAddr  = readPtr(codeRegAddr_ + 0x78);
+    uint64_t cgmCount = readPtr(codeRegAddr_ + 0x78);
+    uint64_t cgmAddr  = readPtr(codeRegAddr_ + 0x80);
     diag_.codeGenModulesCount = cgmCount;
 
     log("  parsing " + std::to_string(cgmCount) + " codeGenModules...");
