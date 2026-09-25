@@ -6,6 +6,7 @@
 #include <cctype>
 #include <fstream>
 #include <algorithm>
+#include <map>
 
 // ---- base detection ----
 
@@ -80,6 +81,59 @@ static uint64_t detect_base_from_init_array(const std::vector<uint8_t>& data,
 
 // ---- load ----
 
+
+// Modal Y detection: cross-section pointer histogram.
+// For each qword in scan sections that looks like a runtime pointer,
+// hypothesize Y = value - section_vaddr for each "target" section,
+// and take the most common page-aligned Y.
+static uint64_t detect_base_modal(const std::vector<uint8_t>& data, const ElfInfo& elf, const LogFn& log) {
+    std::vector<uint64_t> scanOffsets;
+    std::vector<uint64_t> scanSizes;
+    std::vector<std::string> scanNames = {".data.rel.ro", ".data", ".got", ".got.plt", ".init_array", ".fini_array"};
+    for (const auto& s : elf.sections) {
+        for (auto& n : scanNames) if (s.name == n) {
+            if (s.sh_offset + s.sh_size <= data.size()) { scanOffsets.push_back(s.sh_offset); scanSizes.push_back(s.sh_size); }
+            break;
+        }
+    }
+    std::vector<uint64_t> targetVaddrs;
+    for (const auto& s : elf.sections) {
+        if (s.name == ".text" || s.name == ".rodata" || s.name == ".data" ||
+            s.name == ".data.rel.ro" || s.name == ".plt" || s.name == ".eh_frame") {
+            if (s.sh_addr != 0) targetVaddrs.push_back(s.sh_addr);
+        }
+    }
+    std::map<uint64_t, size_t> hist;
+    for (size_t si = 0; si < scanOffsets.size(); si++) {
+        size_t lo = (scanOffsets[si] + 7) & ~7ull;
+        size_t hi = scanOffsets[si] + scanSizes[si];
+        for (size_t i = lo; i + 8 <= hi; i += 8) {
+            uint64_t v; std::memcpy(&v, data.data() + i, 8);
+            if (v < 0x100000000ull || v > 0x800000000000ull) continue;
+            for (uint64_t sv : targetVaddrs) {
+                if (v < sv) continue;
+                uint64_t y = v - sv;
+                if ((y & 0xFFF) != 0) continue;
+                if (y < 0x100000000ull || y > 0x800000000000ull) continue;
+                hist[y]++;
+            }
+        }
+    }
+    uint64_t bestY = 0; size_t bestCount = 0;
+    for (auto& kv : hist) if (kv.second > bestCount) { bestCount = kv.second; bestY = kv.first; }
+    if (bestCount < 3) {
+        char b[128]; snprintf(b, sizeof(b), "  modal Y: no clear peak (best hits=%zu)", bestCount);
+        log(b);
+        return 0;
+    }
+    {
+        char b[200]; snprintf(b, sizeof(b), "  modal Y = 0x%llx (hits=%zu, %zu candidates)",
+                             (unsigned long long)bestY, bestCount, hist.size());
+        log(b);
+    }
+    return bestY;
+}
+
 bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { log("cannot open " + path); return false; }
@@ -97,14 +151,37 @@ bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
     if (!elf_.valid) { log("not a valid ELF"); return false; }
     log("  parsed ELF, " + std::to_string(elf_.sections.size()) + " sections");
 
+    // Diagnostic: dump .init_array and .got raw contents
+    {
+        char b[128];
+        for (const auto& s : elf_.sections) {
+            if (s.name != ".init_array" && s.name != ".got" && s.name != ".got.plt") continue;
+            if (s.sh_offset + s.sh_size > data_.size()) continue;
+            snprintf(b, sizeof(b), "  %s first 8 qwords:", s.name.c_str());
+            log(b);
+            int n = (int)std::min<size_t>(8, s.sh_size / 8);
+            for (int k = 0; k < n; k++) {
+                uint64_t v; std::memcpy(&v, data_.data() + s.sh_offset + k * 8, 8);
+                snprintf(b, sizeof(b), "    %s[%d] = 0x%llx", s.name.c_str(), k, (unsigned long long)v);
+                log(b);
+            }
+        }
+    }
+
     // 1. try filename parse
     base_ = parse_base_from_path(path);
     if (base_ != 0) log("  base from filename");
 
-    // 2. fall back to init_array detection
+    // 2. init_array heuristic
     if (base_ == 0) {
         base_ = detect_base_from_init_array(data_, elf_, log);
         if (base_ != 0) log("  base from init_array");
+    }
+
+    // 3. modal Y from cross-section pointers in .data.rel.ro / .data / .got
+    if (base_ == 0) {
+        base_ = detect_base_modal(data_, elf_, log);
+        if (base_ != 0) log("  base from modal pointer analysis");
     }
 
     if (base_ == 0) {
