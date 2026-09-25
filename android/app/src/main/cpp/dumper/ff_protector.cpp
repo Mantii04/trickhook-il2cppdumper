@@ -42,23 +42,55 @@ bool ff_unpack(ElfInfo& elf, std::vector<uint8_t>& buf, const LogFn& log) {
     const uint8_t* data = buf.data();
     size_t size = buf.size();
 
-    // 1. Find the descriptor magic 0x12345678 in the trailing region.
-    //    Descriptor is inside the appended stub ELF. Search the last 4 MB.
-    size_t search_start = size > 4*1024*1024 ? size - 4*1024*1024 : 0;
+    // 1. Scan the whole file for the descriptor magic 0x12345678.
+    //    Validate each hit against real bounds before accepting it.
     size_t desc_off = SIZE_MAX;
-    for (size_t i = search_start; i + 0x200 <= size; i += 4) {
+    size_t best_size = 0;
+    size_t hits = 0;
+    for (size_t i = 0; i + 0x200 <= size; i += 4) {
         uint32_t m; std::memcpy(&m, data + i, 4);
-        if (m == 0x12345678u) {
-            // Sanity: section name should be printable and begin with '.'
-            const char* nm = (const char*)(data + i + 4);
-            if (nm[0] == '.' && nm[1] >= 'a' && nm[1] <= 'z') { desc_off = i; break; }
+        if (m != 0x12345678u) continue;
+        hits++;
+        const char* nm = (const char*)(data + i + 4);
+        if (nm[0] != '.') continue;
+        bool printable = true;
+        int nlen = 0;
+        for (int k = 0; k < 16; k++) {
+            char c = nm[k];
+            if (c == 0) break;
+            if (c < 0x20 || c > 0x7e) { printable = false; break; }
+            nlen++;
+        }
+        if (!printable || nlen < 2) continue;
+
+        uint32_t fo, sz;
+        std::memcpy(&fo, data + i + 0x14, 4);
+        std::memcpy(&sz, data + i + 0x1c, 4);
+        if (fo == 0 || sz == 0) continue;
+        if ((uint64_t)fo + sz > size) continue;
+        if (sz < 0x10000) continue;
+
+        if (sz > best_size) {
+            best_size = sz;
+            desc_off = i;
         }
     }
     if (desc_off == SIZE_MAX) {
-        log("  no packer descriptor found (0x12345678) — .so assumed already plaintext");
+        char buf[96];
+        snprintf(buf, sizeof(buf), "  no descriptor found (scanned %zu MB, %zu magic hits)",
+                 size / 1024 / 1024, hits);
+        log(buf);
+        log("  .so assumed already plaintext");
         return true;
     }
-    log("Detected packed ELF (stub_decrypt_elf)");
+    {
+        char buf[128];
+        const char* nm = (const char*)(data + desc_off + 4);
+        char name16[17]; memcpy(name16, nm, 16); name16[16] = 0;
+        snprintf(buf, sizeof(buf), "Detected packed ELF — descriptor at 0x%zx, section %s",
+                 desc_off, name16);
+        log(buf);
+    }
 
     uint32_t file_off, vaddr, sec_size, desc_crc;
     std::memcpy(&file_off, data + desc_off + 0x14, 4);

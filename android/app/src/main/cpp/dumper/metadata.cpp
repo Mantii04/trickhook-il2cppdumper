@@ -159,11 +159,12 @@ static void write_type(std::FILE* f, const Metadata& m, const TypeDefinition& td
                        + (size_t)(td.methodStart + i) * m.method_stride;
             if (off + m.method_stride > m.size) break;
             Reader r{m.data, m.size}; r.seek(off);
-            int32_t nameIdx = r.i32();
-            r.skip(4 + 4 + 4);              // declaringType, returnType, parameterStart
-            r.skip(4);                       // genericContainerIndex
-            if (m.method_stride >= 40) r.skip(4);  // padding
-            r.skip(4);                       // token
+            int32_t nameIdx = r.i32();       // +0x00
+            r.skip(4 + 4 + 4);               // declaringType, returnType, parameterStart -> +0x10
+            r.skip(4);                        // genericContainerIndex -> +0x14
+            r.skip(4);                        // unnamed v31 field -> +0x18
+            if (m.method_stride >= 40) r.skip(4); // FF padding -> +0x1c
+            r.skip(4);                        // token
             uint16_t flags = r.u16();
             r.skip(2);                       // iflags
             r.skip(2);                       // slot
