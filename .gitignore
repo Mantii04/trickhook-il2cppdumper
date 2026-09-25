@@ -362,8 +362,10 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 # --- fork ---
-# builds locais (dotnet publish -o dist/)
+# builds locais (dotnet publish -o dist/
+dist.*)
 dist/
+dist.*
 
 # saidas do dumper
 out/

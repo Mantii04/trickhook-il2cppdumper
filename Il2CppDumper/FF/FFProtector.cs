@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Il2CppDumper
@@ -10,21 +11,31 @@ namespace Il2CppDumper
     ///
     /// O stub e anexado no fim do .so (varios PT_LOAD apontando pro mesmo file
     /// offset) e roda via DT_INIT. Ele exporta "stub_decrypt_elf" e carrega um
-    /// descritor com magic 0x12345678 que diz qual secao esta empacotada e
-    /// carrega a chave. O codigo que faz a transformacao mora em libanort.so,
-    /// nao no proprio libil2cpp.
+    /// descritor com magic 0x12345678. O codigo que faz a transformacao nao
+    /// esta no libil2cpp: o stub chama g_acf_array[1], um import resolvido do
+    /// libanort.so.
     ///
-    /// Esquema (identico em armeabi-v7a e arm64-v8a, medido por diff disco x
-    /// dump de memoria nas duas ABIs):
-    ///   - so a secao do descritor (na pratica .rodata) e alterada
-    ///   - janelas de 0x4000 bytes a cada 0x10000, a primeira em
-    ///     (secao_inicio &amp; ~0xFFF) + 0x2000
-    ///   - cada janela e XOR com uma chave de 1 byte E permutada entre slots
-    ///     de 0x10000, em grupos de 8 janelas consecutivas
+    /// Esquema completo, reversado do libanort e validado byte a byte contra
+    /// dump de memoria nas duas ABIs:
     ///
-    /// A janela 0 usa outra cifra (entropia 7.99, sem preimagem sob nenhuma das
-    /// 256 chaves em lugar nenhum do arquivo) e so sai de um dump de memoria.
-    /// Todas as outras sao recuperadas exatamente.
+    ///   K = uint32 big-endian em keyblob[12:16], onde keyblob e o base64 do
+    ///       descritor+0x1a8 decodificado e XOR 0x4F. Todo o material de chave
+    ///       sai desse dword: a chave XOR do bulk e (K &gt;&gt; 16) &amp; 0xFF e a chave
+    ///       AES e o ASCII de "%08x%08x" % (K, K).
+    ///
+    ///   Regiao = a secao do descritor, comecando em (inicio &amp; ~0xFFF) + 0x2000.
+    ///
+    ///   Secao menor que 1 MB: XOR puro na regiao inteira, sem AES nem permuta.
+    ///
+    ///   Senao:
+    ///     janela 0 (0x4000 bytes) = AES-128-CBC, IV fixo 02..11, em 8 blocos
+    ///       independentes de 0x800 com o IV reiniciado a cada bloco;
+    ///     do +0x10000 em diante = XOR de 1 byte + permutacao entre slots de
+    ///       0x10000, em grupos de 8 janelas de 0x4000 (algo 1), ou XOR puro
+    ///       sem permutacao (algo 2, descritor+0x188).
+    ///
+    /// O descritor carrega em +0x20 o CRC32 da secao em claro, entao o
+    /// resultado se verifica sozinho.
     /// </summary>
     public static class FFProtector
     {
@@ -33,21 +44,34 @@ namespace Il2CppDumper
         /// Constante do packer que ofusca os parametros do descritor. Ela
         /// transforma o blob de chave em big-endian 0x20240829 (a data de build
         /// do packer) seguido de dois 1s - e a unica das 256 candidatas que faz
-        /// isso, identicamente, em binarios com chaves de secao diferentes.
+        /// isso, identicamente, em binarios com chaves diferentes.
         private const byte ObfuscationConstant = 0x4F;
 
         private const int WindowSize = 0x4000;
         private const int SlotStride = 0x10000;
         private const int FirstWindowPhase = 0x2000;
 
-        /// Offsets dentro do descritor onde a chave da secao aparece.
-        private const int KeyByteOffset = 0x186;   // byte solto, ofuscado com ObfuscationConstant
-        private const int KeyBlobOffset = 0x1a8;   // string base64, byte 13 do conteudo ofuscado
+        /// Abaixo disso o packer nem usa AES nem permuta: XOR puro na regiao.
+        private const long SmallSectionLimit = 0x100000;
+
+        private const int KeyByteOffset = 0x186;   // chave XOR, ofuscada
+        private const int AlgoOffset = 0x188;
+        private const int KeyBlobOffset = 0x1a8;   // base64 com o material de chave
+
+        /// Chave XOR usada quando o byte correspondente de K e zero.
+        private const byte FallbackXorKey = 0x87;
+
+        private const int Window0ChunkSize = 0x800;
+        private static readonly byte[] Window0Iv =
+        {
+            0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11
+        };
 
         /// Deslocamento, em slots de 0x10000, da janela de ORIGEM em relacao a
-        /// janela de DESTINO, indexado por (indice_da_janela % 8).
-        /// Equivale a permutar cada grupo de 8 janelas consecutivas por
-        /// sigma = [4, 0, 6, 2, 1, 3, 5, 7], grupos comecando em i % 8 == 2.
+        /// janela de DESTINO, indexado por (indice_da_janela % 8). Equivale a
+        /// permutar cada grupo de 8 janelas consecutivas por
+        /// sigma = [4, 0, 6, 2, 1, 3, 5, 7].
         private static readonly int[] SlotDelta = { -1, 0, 4, -1, 4, -1, -3, -2 };
 
         public sealed class Descriptor
@@ -60,6 +84,7 @@ namespace Il2CppDumper
             public uint Checksum;
             public uint FirstLoadFileSize;
             public uint Kind;
+            public uint Algo;
 
             public override string ToString() =>
                 $"{Name} offset=0x{Offset:x} vaddr=0x{VirtualAddress:x} size=0x{Size:x}";
@@ -72,6 +97,8 @@ namespace Il2CppDumper
             public Descriptor Descriptor;
             public byte Key;
             public string KeySource = "";
+            public uint AesSeed;
+            public string Window0Method = "not attempted";
             public int WindowsTotal;
             public int WindowsRecovered;
             public int WindowsSkipped;
@@ -104,6 +131,8 @@ namespace Il2CppDumper
                     FirstLoadFileSize = BitConverter.ToUInt32(data, (int)i + 0x28),
                     Kind = BitConverter.ToUInt32(data, (int)i + 0x2c),
                 };
+                if (i + AlgoOffset + 4 <= data.Length)
+                    d.Algo = BitConverter.ToUInt32(data, (int)i + AlgoOffset);
 
                 if (d.Size == 0 || d.Offset == 0) continue;
                 if ((long)d.Offset + d.Size > data.Length) continue;
@@ -153,12 +182,12 @@ namespace Il2CppDumper
             byte hist = MostFrequentByte(data, windows, start, end);
             if (hist == 0) return r;
 
-            // A chave tambem esta guardada em dois lugares do descritor. Exigir
-            // que duas fontes independentes concordem evita corromper o arquivo
-            // se o layout do descritor mudar num build futuro.
+            var blob = ReadKeyBlob(data, d);
             byte fromByte = KeyFromDescriptorByte(data, d);
-            byte fromBlob = KeyFromDescriptorBlob(data, d);
+            byte fromBlob = blob != null ? blob[13] : (byte)0;
 
+            // Exigir que duas fontes independentes concordem evita corromper o
+            // arquivo se o layout do descritor mudar num build futuro.
             byte key;
             string src;
             if (fromByte != 0 && fromByte == fromBlob) { key = fromByte; src = "descriptor"; }
@@ -170,45 +199,71 @@ namespace Il2CppDumper
                 Console.WriteLine("WARNING: packed section detected but the key could not be confirmed; leaving it alone.");
                 return r;
             }
+            if (key == 0) key = FallbackXorKey;
 
             r.Key = key;
             r.KeySource = src;
 
-            // As janelas sao permutadas em grupos de 8 consecutivas. O grupo
-            // parcial do fim nao e permutado (so XOR no lugar), e a janela 0,
-            // que nao pertence a grupo nenhum, usa outra cifra.
-            int n = windows.Count;
-            int lastGroupStart = 2 + 8 * ((n - 2) / 8);
-
             var outBuf = (byte[])data.Clone();
-            foreach (var (index, dst) in windows)
+
+            if (d.Size < SmallSectionLimit)
             {
-                if (index == 0)
+                // Secao pequena: o packer so faz XOR, sem AES e sem permuta.
+                for (long i = windows[0].start; i < end; i++)
+                    outBuf[i] = (byte)(data[i] ^ key);
+                r.WindowsRecovered = windows.Count;
+                r.Window0Method = "n/a (small section, plain XOR)";
+            }
+            else
+            {
+                // Janela 0: AES-128-CBC com a chave derivada de K.
+                long w0 = windows[0].start;
+                int w0Len = (int)Math.Min(WindowSize, end - w0);
+                uint seed = blob != null
+                    ? (uint)((blob[12] << 24) | (blob[13] << 16) | (blob[14] << 8) | blob[15])
+                    : 0u;
+
+                if (seed != 0 && TryDecryptWindow0(data, outBuf, w0, w0Len, seed))
                 {
-                    // Janela 0 usa outra cifra e nao sai daqui.
+                    r.AesSeed = seed;
+                    r.Window0Method = "AES-128-CBC";
+                    r.WindowsRecovered++;
+                }
+                else
+                {
+                    r.Window0Method = "failed";
                     r.WindowsSkipped++;
-                    r.BytesUnrecovered += Math.Min(WindowSize, end - dst);
-                    continue;
+                    r.BytesUnrecovered += w0Len;
                 }
 
-                long delta = index >= lastGroupStart ? 0 : (long)SlotDelta[index % SlotDelta.Length] * SlotStride;
-                long srcPos = dst + delta;
+                // Resto: XOR + permutacao entre slots (algo 1) ou XOR puro (algo 2).
+                bool permute = d.Algo != 2;
+                int n = windows.Count;
+                int lastGroupStart = 2 + 8 * ((n - 2) / 8);
 
-                // A ULTIMA janela nao e cortada em 0x4000: ela vai ate o fim da
-                // secao. No build arm32 isso e 0x9FEC em vez de 0x4000, e sem
-                // isso sobram ~24 KB empacotados.
-                int len = (int)(index == windows.Count - 1 ? end - dst : Math.Min(WindowSize, end - dst));
-
-                if (srcPos < start || srcPos + len > end)
+                foreach (var (index, dst) in windows)
                 {
-                    r.WindowsSkipped++;
-                    r.BytesUnrecovered += len;
-                    continue;
-                }
+                    if (index == 0) continue;   // ja tratada acima
 
-                for (int i = 0; i < len; i++)
-                    outBuf[dst + i] = (byte)(data[srcPos + i] ^ key);
-                r.WindowsRecovered++;
+                    long delta = (!permute || index >= lastGroupStart)
+                        ? 0
+                        : (long)SlotDelta[index % SlotDelta.Length] * SlotStride;
+                    long srcPos = dst + delta;
+
+                    // A ULTIMA janela nao e cortada em 0x4000: ela vai ate o fim
+                    // da secao. No build arm32 isso e 0x9FEC em vez de 0x4000.
+                    int len = (int)(index == n - 1 ? end - dst : Math.Min(WindowSize, end - dst));
+
+                    if (srcPos < start || srcPos + len > end)
+                    {
+                        r.WindowsSkipped++;
+                        r.BytesUnrecovered += len;
+                        continue;
+                    }
+                    for (int i = 0; i < len; i++)
+                        outBuf[dst + i] = (byte)(data[srcPos + i] ^ key);
+                    r.WindowsRecovered++;
+                }
             }
 
             // descritor+0x20 e o CRC32 da secao em claro, entao da pra conferir
@@ -217,8 +272,8 @@ namespace Il2CppDumper
             r.ActualCrc = Crc32(outBuf, start, end - start);
             r.ChecksumVerified = r.ActualCrc == r.ExpectedCrc;
 
-            // A janela 0 nao sai do arquivo. Se houver um sidecar pra este
-            // build, aplica e confere de novo.
+            // Rede de seguranca: se a cifra da janela 0 mudar num build futuro,
+            // um sidecar capturado de dump de memoria ainda resolve.
             if (!r.ChecksumVerified &&
                 FFWindow0Patch.TryApply(outBuf, d.Checksum, inputPath, out var patchFrom))
             {
@@ -227,8 +282,6 @@ namespace Il2CppDumper
                 if (r.ChecksumVerified)
                 {
                     r.Window0PatchFrom = patchFrom;
-                    r.WindowsRecovered++;
-                    r.WindowsSkipped--;
                     r.BytesUnrecovered = 0;
                 }
             }
@@ -238,65 +291,68 @@ namespace Il2CppDumper
             return r;
         }
 
-        /// Chave guardada como byte solto no descritor, ofuscada com 0x4F.
-        private static byte KeyFromDescriptorByte(byte[] data, Descriptor d)
+        /// Janela 0: AES-128-CBC em blocos independentes de 0x800, IV fixo
+        /// reiniciado a cada bloco, sem padding.
+        private static bool TryDecryptWindow0(byte[] src, byte[] dst, long offset, int length, uint k)
         {
-            long at = d.FilePosition + KeyByteOffset;
-            if (at < 0 || at >= data.Length) return 0;
-            return (byte)(data[at] ^ ObfuscationConstant);
+            try
+            {
+                if (length < Window0ChunkSize || offset + length > src.Length) return false;
+                var key = Encoding.ASCII.GetBytes($"{k:x8}{k:x8}");
+                if (key.Length != 16) return false;
+
+                using var aes = Aes.Create();
+                aes.Key = key;
+                var chunk = new byte[Window0ChunkSize];
+                for (int off = 0; off + Window0ChunkSize <= length; off += Window0ChunkSize)
+                {
+                    Buffer.BlockCopy(src, (int)offset + off, chunk, 0, Window0ChunkSize);
+                    var plain = aes.DecryptCbc(chunk, Window0Iv, PaddingMode.None);
+                    Buffer.BlockCopy(plain, 0, dst, (int)offset + off, Window0ChunkSize);
+                }
+                return true;
+            }
+            catch (CryptographicException)
+            {
+                return false;
+            }
         }
 
-        /// Chave guardada num blob base64 no descritor. Decodificado e XOR com
-        /// 0x4F, o blob e: build date BE | 1 | 1 | dois pares de 4 bytes, e o
-        /// byte 13 e a chave da secao.
-        private static byte KeyFromDescriptorBlob(byte[] data, Descriptor d)
+        /// Blob base64 do descritor, decodificado e desofuscado. Contem a data de
+        /// build do packer, dois 1s e o material de chave.
+        private static byte[] ReadKeyBlob(byte[] data, Descriptor d)
         {
             long at = d.FilePosition + KeyBlobOffset;
-            if (at < 0 || at + 28 > data.Length) return 0;
+            if (at < 0 || at + 28 > data.Length) return null;
 
             var sb = new StringBuilder();
             for (long i = at; i < data.Length && i < at + 64; i++)
             {
                 byte b = data[i];
                 if (b == 0) break;
-                if (b < 0x20 || b > 0x7e) return 0;
+                if (b < 0x20 || b > 0x7e) return null;
                 sb.Append((char)b);
             }
             try
             {
                 var raw = Convert.FromBase64String(sb.ToString());
-                if (raw.Length < 14) return 0;
-                // valida o cabecalho antes de confiar no byte da chave
-                for (int i = 0; i < 4; i++) raw[i] ^= ObfuscationConstant;
-                if (raw[0] != 0x20) return 0;   // data de build, sempre 20xx
-                return (byte)(raw[13] ^ ObfuscationConstant);
+                if (raw.Length < 16) return null;
+                for (int i = 0; i < raw.Length; i++) raw[i] ^= ObfuscationConstant;
+                if (raw[0] != 0x20) return null;   // data de build, sempre 20xx
+                return raw;
             }
-            catch
+            catch (FormatException)
             {
-                return 0;
+                return null;
             }
         }
 
-        private static readonly uint[] CrcTable = BuildCrcTable();
-
-        private static uint[] BuildCrcTable()
+        /// Chave XOR guardada como byte solto no descritor, ofuscada com 0x4F.
+        private static byte KeyFromDescriptorByte(byte[] data, Descriptor d)
         {
-            var t = new uint[256];
-            for (uint i = 0; i < 256; i++)
-            {
-                uint c = i;
-                for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-                t[i] = c;
-            }
-            return t;
-        }
-
-        private static uint Crc32(byte[] data, long offset, long length)
-        {
-            uint c = 0xFFFFFFFFu;
-            for (long i = 0; i < length; i++)
-                c = CrcTable[(c ^ data[offset + i]) & 0xFF] ^ (c >> 8);
-            return c ^ 0xFFFFFFFFu;
+            long at = d.FilePosition + KeyByteOffset;
+            if (at < 0 || at >= data.Length) return 0;
+            return (byte)(data[at] ^ ObfuscationConstant);
         }
 
         private static List<(int index, long start)> EnumerateWindows(long sectionStart, long sectionEnd)
@@ -352,6 +408,28 @@ namespace Il2CppDumper
             return best;
         }
 
+        private static readonly uint[] CrcTable = BuildCrcTable();
+
+        private static uint[] BuildCrcTable()
+        {
+            var t = new uint[256];
+            for (uint i = 0; i < 256; i++)
+            {
+                uint c = i;
+                for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                t[i] = c;
+            }
+            return t;
+        }
+
+        private static uint Crc32(byte[] data, long offset, long length)
+        {
+            uint c = 0xFFFFFFFFu;
+            for (long i = 0; i < length; i++)
+                c = CrcTable[(c ^ data[offset + i]) & 0xFF] ^ (c >> 8);
+            return c ^ 0xFFFFFFFFu;
+        }
+
         public static void Report(Result r)
         {
             if (!r.Detected) return;
@@ -361,8 +439,10 @@ namespace Il2CppDumper
                 Console.WriteLine("  Section content already looks unpacked, leaving it alone.");
                 return;
             }
-            Console.WriteLine($"  Unpacked with key 0x{r.Key:X2} (from {r.KeySource}): " +
-                              $"{r.WindowsRecovered}/{r.WindowsTotal} windows recovered");
+            Console.WriteLine($"  Unpacked with key 0x{r.Key:X2} (from {r.KeySource}), " +
+                              $"window 0 via {r.Window0Method}" +
+                              (r.AesSeed != 0 ? $" seed 0x{r.AesSeed:x8}" : "") +
+                              $": {r.WindowsRecovered}/{r.WindowsTotal} windows recovered");
             if (r.Window0PatchFrom != null)
                 Console.WriteLine($"  Window 0 restored from {r.Window0PatchFrom}");
             if (r.ChecksumVerified)
@@ -372,9 +452,9 @@ namespace Il2CppDumper
             else
             {
                 Console.WriteLine($"  CRC32 0x{r.ActualCrc:X8} != descriptor 0x{r.ExpectedCrc:X8}; " +
-                                  $"{r.BytesUnrecovered} byte(s) use a different cipher and stay packed.");
-                Console.WriteLine("  Capture it once with tools/ffwindow0.py to get a byte-exact section " +
-                                  "from the APK from now on, or dump from memory (tools/ffdump.py).");
+                                  $"{r.BytesUnrecovered} byte(s) could not be recovered.");
+                Console.WriteLine("  Dump the library from memory instead (see tools/ffdump.py), or capture " +
+                                  "window 0 once with tools/ffwindow0.py.");
             }
         }
     }

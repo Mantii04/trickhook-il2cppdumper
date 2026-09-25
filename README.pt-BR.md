@@ -20,7 +20,7 @@ Todo push gera três pacotes no CI — pegue na aba **Actions**, na run mais rec
 | `Il2CppDumper-win-x64` | `.exe` único, ~1 MB, precisa do runtime .NET 8 |
 | `Il2CppDumper-portable` | `dotnet Il2CppDumper.dll`, qualquer SO com .NET 8 |
 
-Cada pacote já vem com `config.json`, os sidecars de `ffpatches/`, o `tools/` e os READMEs.
+Cada pacote já vem com `config.json`, o `tools/` e os READMEs.
 Subir uma tag `v*` também publica tudo como Release do GitHub.
 
 ## Resultado
@@ -33,6 +33,8 @@ dump de memória, ignorando os comentários de endereço (que mudam por definiç
 | `.so` arm64 do APK | 128/128 | ✅ bate | 43627 | 403993 | 0 | **1650704 / 1650704 = 100,0000%** |
 | `.so` armeabi-v7a do APK | 126/126 | ✅ bate | 43627 | 403993 | 0 | **1650704 / 1650704 = 100,0000%** |
 | qualquer um, da memória | — | — | 43627 | 403993 | 0 | — |
+
+Não precisa de mais nada além do APK — sem dump de memória, sem dado capturado, sem preparo por build.
 
 O CRC32 não é conferência nossa: o descritor do próprio packer carrega o CRC32 da seção em claro, então
 ele batendo é prova de que o `.rodata` desempacotado é byte a byte igual ao que o loader produz em
@@ -129,6 +131,10 @@ descritor+0x1a8      string base64; decodifica e faz XOR 0x4F em cada byte
 `0x4F` é a única das 256 candidatas que transforma o blob em `0x20240829` seguido de dois `1`s
 big-endian, identicamente em dois binários empacotados de forma independente e com chaves diferentes.
 
+Todo o material de chave é um dword só. Com `K` = o `uint32` big-endian em `keyblob[12:16]`, a chave
+XOR do bulk é `(K >> 16) & 0xFF` — que é exatamente o byte do `descritor+0x186` — e a chave AES da
+janela 0 também sai de `K` (abaixo). O fork cruza as duas.
+
 O fork ainda cruza com um terceiro sinal independente: o **byte mais frequente** da região empacotada
 também entrega a chave (o `.rodata` em claro é dominado por `0x00`, com 4× de folga pro segundo).
 Histograma dando `0x00` significa que a seção já está em claro — é assim que um dump de memória passa
@@ -136,31 +142,29 @@ batido. Ele só desempacota quando duas fontes independentes concordam.
 
 Implementado em [`Il2CppDumper/FF/FFProtector.cs`](Il2CppDumper/FF/FFProtector.cs).
 
-### Janela 0 — a única peça que não dá pra inverter offline
+### Janela 0 — AES-128-CBC
 
-Os primeiros `0x4000` bytes da região usam cifra de verdade, com chave por binário, implementada no
-`libanort.so`. O que foi medido:
+Os primeiros `0x4000` bytes da região não levam XOR nenhum. São **AES-128-CBC**, aplicados em
+**8 blocos independentes de `0x800`** com o IV reiniciado a cada um:
 
-- keystream com entropia **7,989**, sem período em 16/32/…/8192
-- os keystreams de arm32 e arm64 coincidem em 63/16384 bytes — exatamente o acaso
-- **não é ECB**: no arm32 o bloco de texto claro `696e652e5061727469636c6553797374` aparece 7 vezes e
-  mapeia pra 7 blocos cifrados diferentes
-- busca de preimagem invariante a XOR no arquivo inteiro, granularidade `0x1000`/`0x400`/`0x100`: 0
-  acertos — o claro não é cópia permutada de nada no binário
-- ~250 mil chaves candidatas tiradas do descritor, do blob do stub e do blob de chave (cru, decodificado
-  e XOR `0x4F`, mais md5/sha256 de cada) testadas contra AES-128/192/256 ECB/CBC/CTR e RC4: nenhum acerto
+```
+chave = ASCII de "%08x%08x" % (K, K)      # 16 chars = AES-128
+iv    = 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11
+padding = nenhum
+```
 
-Então ela é capturada uma vez por build. O `tools/ffwindow0.py` extrai esses 16 KB de um dump de memória
-pra um sidecar nomeado pelo CRC32 da seção; o dumper pega sozinho da pasta `ffpatches/` e aí o CRC32 do
-descritor confirma que o resultado é byte-exato. Um dump de memória por build do jogo, e toda rodada
-estática depois disso sai completa.
+arm32 `K = 0xc56a888f` → chave `"c56a888fc56a888f"`; arm64 `K = 0xcbe04605` → chave `"cbe04605cbe04605"`.
+Os dois reproduzem a janela byte a byte, 16384/16384. Decifrar com o dword vizinho do blob de chave
+dá 0,39%, ou seja, acaso.
 
-Os sidecars dos builds testados aqui estão em
-[`Il2CppDumper/bin/Release/net8.0/ffpatches/`](Il2CppDumper/bin/Release/net8.0/ffpatches).
-Sem sidecar, o dump arm64 ainda sai completo (lá a janela 0 não guarda nada que o dumper leia) e o
-arm32 fica com 93 tipos a menos de 43627.
+É mbedTLS dentro do `libanort.so`, alcançado pelo `g_acf_array[1]`. Passa batido por busca de
+constante porque não existe instrução `AESE`/`AESD` de ARMv8 no `.text` e a S-box do AES fica gravada
+com passo de 4 bytes — procurar a S-box contígua de 16 bytes não acha nada.
 
-Implementado em [`Il2CppDumper/FF/FFWindow0Patch.cs`](Il2CppDumper/FF/FFWindow0Patch.cs).
+O `tools/ffwindow0.py` e o `FF/FFWindow0Patch.cs` continuam como rede de segurança: se um build futuro
+mudar essa cifra, você captura os 16 KB uma vez de um dump de memória pra um sidecar
+`ffpatches/<crc32-da-seção>.w0` e o dumper aplica sozinho. Com o caminho AES funcionando, não precisa
+de sidecar nenhum.
 
 ---
 
@@ -224,9 +228,9 @@ duas ABIs. O `libil2cpp.so` fica em `split_config.<abi>.apk`, em `lib/<abi>/`.
 > O diretório de saída precisa existir antes — o upstream cai calado no diretório do executável se não
 > existir.
 
-### Capturando a janela 0 de um build novo (uma vez só)
+### Se um build futuro quebrar o desempacotador
 
-Com o jogo aberto e root no device:
+Se o CRC32 parar de bater, capture a janela 0 uma vez de um processo vivo e o dumper aplica:
 
 ```bash
 adb shell "su -c 'pidof com.dts.freefireth'"
@@ -235,7 +239,7 @@ python tools/ffdump.py --serial <serial> --pid <pid> \
     --lib "lib/arm64/libil2cpp.so" --elf libil2cpp.so --out libil2cpp_memdump.so
 
 python tools/ffwindow0.py --disk libil2cpp.so --mem libil2cpp_memdump.so \
-    --out Il2CppDumper/bin/Release/net8.0/ffpatches/
+    --out ffpatches/
 ```
 
 O `ffwindow0.py` se recusa a gravar o sidecar se o CRC32 da seção no dump de memória não bater com o do
@@ -265,4 +269,4 @@ Saída em `Il2CppDumper/bin/Release/net8.0/`.
 ## Licença e crédito
 
 MIT, igual ao upstream. O trabalho pesado todo é do [Perfare](https://github.com/Perfare); este fork
-só acrescenta os dois detectores acima, o sidecar da janela 0 e tratamento de erro defensivo.
+só acrescenta os dois detectores acima, o desempacotador do protector e tratamento de erro defensivo.

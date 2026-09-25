@@ -13,8 +13,7 @@ survive game updates.
 ```
 Il2CppMethodDefinition layout: non-standard: 40 bytes x 336329, 4 extra byte(s) at +0x18 (expected 36), confidence 100.0%
 Detected packed ELF (stub_decrypt_elf): .rodata offset=0x194a210 vaddr=0x194a210 size=0x7f335b
-  Unpacked with key 0xE0 (from descriptor): 128/128 windows recovered
-  Window 0 restored from ffpatches/6876e3c7.w0
+  Unpacked with key 0xE0 (from descriptor), window 0 via AES-128-CBC seed 0xcbe04605: 128/128 windows recovered
   CRC32 matches the descriptor (0x6876E3C7) - section is byte-exact.
 Dumping...
 Done!
@@ -30,7 +29,7 @@ Every push builds three packages on CI — grab one from the **Actions** tab, ne
 | `Il2CppDumper-win-x64` | single `.exe`, ~1 MB, needs the .NET 8 runtime |
 | `Il2CppDumper-portable` | `dotnet Il2CppDumper.dll`, any OS with .NET 8 |
 
-Each package ships `config.json`, the `ffpatches/` sidecars, `tools/` and the READMEs.
+Each package ships `config.json`, `tools/` and the READMEs.
 Pushing a `v*` tag also publishes them as a GitHub Release.
 
 ## Results
@@ -43,6 +42,8 @@ live memory dump, ignoring the address comments (which differ by definition):
 | arm64 APK `.so` | 128/128 | ✅ match | 43627 | 403993 | 0 | **1650704 / 1650704 = 100.0000%** |
 | armeabi-v7a APK `.so` | 126/126 | ✅ match | 43627 | 403993 | 0 | **1650704 / 1650704 = 100.0000%** |
 | either, memory dump | n/a | n/a | 43627 | 403993 | 0 | — |
+
+Nothing but the APK is needed — no memory dump, no captured data, no per-build setup.
 
 The CRC32 in the last column is not our own check — the packer's descriptor carries the CRC32 of the
 plaintext section, so a match is proof the unpacked `.rodata` is byte-identical to what the loader
@@ -139,6 +140,10 @@ descriptor+0x1a8      base64 string, decode then XOR every byte with 0x4F
 `0x4F` is the only one of 256 candidates that turns the blob into `0x20240829` followed by two
 big-endian `1`s, identically in two independently packed binaries whose section keys differ.
 
+All the key material is one dword. With `K` = the big-endian `uint32` at `keyblob[12:16]`, the bulk
+XOR key is `(K >> 16) & 0xFF` — which is exactly the byte at `descriptor+0x186` — and the window 0
+AES key is derived from `K` as well (below). The fork cross-checks the two against each other.
+
 The fork cross-checks against a third, independent signal: the **most frequent byte** of the packed
 region also yields the key (plaintext `.rodata` is dominated by `0x00`, by 4× over the runner-up).
 A `0x00` histogram result means the section is already plaintext — that is how a memory dump passes
@@ -146,31 +151,28 @@ through untouched. It only unpacks when two independent sources agree.
 
 Implemented in [`Il2CppDumper/FF/FFProtector.cs`](Il2CppDumper/FF/FFProtector.cs).
 
-### Window 0 — the one piece that is not offline-invertible
+### Window 0 — AES-128-CBC
 
-The first `0x4000` bytes of the packed region use a real cipher, keyed per binary, implemented in
-`libanort.so`. What was measured:
+The first `0x4000` bytes of the region are not XOR'd at all. They are **AES-128-CBC**, applied as
+**8 independent `0x800` chunks** with the IV reset for each one:
 
-- keystream entropy **7.989**, no period at 16/32/…/8192
-- the arm32 and arm64 keystreams agree on 63/16384 bytes — exactly chance
-- **not ECB**: in arm32 the plaintext block `696e652e5061727469636c6553797374` occurs 7 times and maps
-  to 7 different ciphertext blocks
-- XOR-invariant preimage search over the entire file at `0x1000`/`0x400`/`0x100` granularity: 0 hits —
-  the plaintext is not a permuted copy of anything in the binary
-- ~250 000 candidate keys drawn from the descriptor, the stub blob and the key blob (raw, base64-decoded
-  and XOR-`0x4F`, plus md5/sha256 of each) tested against AES-128/192/256 ECB/CBC/CTR and RC4: no hit
+```
+key = ASCII of "%08x%08x" % (K, K)      # 16 chars = AES-128
+iv  = 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11
+padding = none
+```
 
-So it is captured once per build instead. `tools/ffwindow0.py` extracts those 16 KB from a memory
-dump into a sidecar named after the section CRC32; the dumper picks it up automatically from
-`ffpatches/` and then the descriptor CRC32 confirms the result is byte-exact. One memory dump per
-game build, and every static run after that is complete.
+arm32 `K = 0xc56a888f` → key `"c56a888fc56a888f"`; arm64 `K = 0xcbe04605` → key `"cbe04605cbe04605"`.
+Both reproduce their window byte-for-byte, 16384/16384. Decrypting with the adjacent dword of the
+key blob instead scores 0.39 %, i.e. chance.
 
-Sidecars for the builds tested here are in
-[`Il2CppDumper/bin/Release/net8.0/ffpatches/`](Il2CppDumper/bin/Release/net8.0/ffpatches).
-Without a sidecar the arm64 dump is still complete (window 0 holds nothing the dumper reads there)
-and the arm32 dump is short by 93 types out of 43627.
+This is mbedTLS inside `libanort.so`, reached through `g_acf_array[1]`. It is invisible to constant
+scanning because there are no ARMv8 `AESE`/`AESD` instructions in `.text` and the AES S-box is stored
+with a 4-byte stride, so searching for the usual contiguous 16-byte S-box finds nothing.
 
-Implemented in [`Il2CppDumper/FF/FFWindow0Patch.cs`](Il2CppDumper/FF/FFWindow0Patch.cs).
+`tools/ffwindow0.py` and `FF/FFWindow0Patch.cs` remain as a fallback: if a future build changes this
+cipher, capture the 16 KB once from a memory dump into a `ffpatches/<section-crc32>.w0` sidecar and
+the dumper applies it automatically. With the AES path working, no sidecar is needed.
 
 ---
 
@@ -233,9 +235,9 @@ ABIs. `libil2cpp.so` is in `split_config.<abi>.apk` under `lib/<abi>/`.
 > The output directory must already exist — upstream silently falls back to the executable's own
 > directory if it does not.
 
-### Capturing window 0 for a new build (once)
+### If a future build breaks the unpacker
 
-With the game running and root on the device:
+If the CRC32 stops matching, capture window 0 once from a live process and the dumper will patch it in:
 
 ```bash
 adb shell "su -c 'pidof com.dts.freefireth'"
@@ -243,8 +245,7 @@ adb shell "su -c 'pidof com.dts.freefireth'"
 python tools/ffdump.py --serial <serial> --pid <pid> \
     --lib "lib/arm64/libil2cpp.so" --elf libil2cpp.so --out libil2cpp_memdump.so
 
-python tools/ffwindow0.py --disk libil2cpp.so --mem libil2cpp_memdump.so \
-    --out Il2CppDumper/bin/Release/net8.0/ffpatches/
+python tools/ffwindow0.py --disk libil2cpp.so --mem libil2cpp_memdump.so --out ffpatches/
 ```
 
 `ffwindow0.py` refuses to write a sidecar unless the memory dump's section CRC32 matches the
@@ -274,4 +275,4 @@ Output in `Il2CppDumper/bin/Release/net8.0/`.
 ## License & credit
 
 MIT, same as upstream. All the heavy lifting is [Perfare](https://github.com/Perfare)'s; this fork
-adds the two detectors above, the window-0 sidecar, and some defensive error handling.
+adds the two detectors above, the protector unpacker, and some defensive error handling.
