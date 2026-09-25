@@ -14,6 +14,7 @@ processFields = [
 	"ScriptMethod",
 	"ScriptString",
 	"ScriptMetadata",
+	"ScriptTypeInfo",
 	"ScriptMetadataMethod",
 	"Addresses",
 ]
@@ -71,8 +72,12 @@ if "ScriptString" in data and "ScriptString" in processFields:
 		index += 1
 		monitor.incrementProgress(1)
 
-if "ScriptMetadata" in data and "ScriptMetadata" in processFields:
-	scriptMetadatas = data["ScriptMetadata"]
+if ("ScriptMetadata" in data and "ScriptMetadata" in processFields) or ("ScriptTypeInfo" in data and "ScriptTypeInfo" in processFields):
+	scriptMetadatas = []
+	if "ScriptMetadata" in data and "ScriptMetadata" in processFields:
+		scriptMetadatas += data["ScriptMetadata"]
+	if "ScriptTypeInfo" in data and "ScriptTypeInfo" in processFields:
+		scriptMetadatas += data["ScriptTypeInfo"]
 	monitor.initialize(len(scriptMetadatas))
 	monitor.setMessage("Metadata")
 	for scriptMetadata in scriptMetadatas:

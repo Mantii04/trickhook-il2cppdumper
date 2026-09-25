@@ -436,7 +436,7 @@ namespace Il2CppDumper
             var type = il2Cpp.types[index];
             var typeName = executor.GetTypeName(type, true, false);
             var scriptMetadata = new ScriptMetadata();
-            json.ScriptMetadata.Add(scriptMetadata);
+            json.ScriptTypeInfo.Add(scriptMetadata);
             scriptMetadata.Address = il2Cpp.GetRVA(address);
             scriptMetadata.Name = typeName + "_TypeInfo";
             var signature = GetIl2CppStructName(type);

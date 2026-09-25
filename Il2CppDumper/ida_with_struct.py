@@ -5,6 +5,7 @@ processFields = [
 	"ScriptMethod",
 	"ScriptString",
 	"ScriptMetadata",
+	"ScriptTypeInfo",
 	"ScriptMetadataMethod",
 	"Addresses",
 ]
@@ -61,8 +62,12 @@ if "ScriptString" in data and "ScriptString" in processFields:
 		idc.set_cmt(addr, value, 1)
 		index += 1
 
-if "ScriptMetadata" in data and "ScriptMetadata" in processFields:
-	scriptMetadatas = data["ScriptMetadata"]
+if ("ScriptMetadata" in data and "ScriptMetadata" in processFields) or ("ScriptTypeInfo" in data and "ScriptTypeInfo" in processFields):
+	scriptMetadatas = []
+	if "ScriptMetadata" in data and "ScriptMetadata" in processFields:
+		scriptMetadatas += data["ScriptMetadata"]
+	if "ScriptTypeInfo" in data and "ScriptTypeInfo" in processFields:
+		scriptMetadatas += data["ScriptTypeInfo"]
 	for scriptMetadata in scriptMetadatas:
 		addr = get_addr(scriptMetadata["Address"])
 		name = scriptMetadata["Name"].encode("utf-8")
