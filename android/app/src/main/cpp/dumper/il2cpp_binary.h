@@ -7,13 +7,11 @@
 
 struct Metadata;
 
-// v31 il2cpp runtime layouts (arm64)
 struct Il2CppType {
     uint64_t datapoint;
     uint32_t bits;
-    // decoded from bits via Init()
     uint32_t attrs = 0;
-    uint8_t  type_enum = 0;  // Il2CppTypeEnum
+    uint8_t  type_enum = 0;
     uint8_t  num_mods = 0;
     uint8_t  byref = 0;
     uint8_t  pinned = 0;
@@ -33,13 +31,6 @@ struct Il2CppGenericInst {
     uint64_t type_argv;
 };
 
-struct Il2CppGenericClass {
-    uint64_t type;      // v27+
-    uint64_t class_inst;
-    uint64_t method_inst;
-    uint64_t cached_class;
-};
-
 struct Il2CppMethodSpec {
     int32_t methodDefinitionIndex;
     int32_t classIndexIndex;
@@ -57,37 +48,30 @@ class Il2CppBinary {
 public:
     Il2CppBinary() = default;
 
-    // load from file (memory dump or on-disk .so)
     bool load(const std::string& path, const LogFn& log);
-
-    // after load: search for CodeRegistration + MetadataRegistration
     bool findRegistrations(const Metadata& md, const LogFn& log);
     bool parseRegistrations(const Metadata& md, const LogFn& log);
 
-    // accessors
     const std::vector<Il2CppType>& types() const { return types_; }
     const Il2CppType* typeAt(uint64_t pointer) const;
     const std::vector<Il2CppGenericInst>& genericInsts() const { return genericInsts_; }
     const std::vector<Il2CppMethodSpec>& methodSpecs() const { return methodSpecs_; }
     const std::vector<Il2CppCodeGenModule>& codeGenModules() const { return codeGenModules_; }
 
-    // method address lookup: (imageName, methodToken & 0xFFFFFF) - 1 -> real VA
     uint64_t methodPointer(const std::string& imageName, uint32_t token) const;
 
-    // helpers
-    uint64_t readPtr(uint64_t vaddr) const;
-    int32_t  readI32(uint64_t vaddr) const;
-    uint32_t readU32(uint64_t vaddr) const;
-    uint16_t readU16(uint64_t vaddr) const;
-    std::string readCStr(uint64_t vaddr) const;
+    uint64_t readQwordAt(size_t normOffset) const;
+    int32_t  readI32At(size_t normOffset) const;
+    uint16_t readU16At(size_t normOffset) const;
+    std::string readCStrAt(size_t normOffset) const;
+    size_t runtimeToOffset(uint64_t runtimeAddr) const;
 
-    uint64_t mapVaddrToOffset(uint64_t vaddr) const;
-    bool isInRange(uint64_t vaddr, size_t len) const;
+    size_t findStringInSection(const std::string& sectionName, const std::string& needle) const;
+    size_t findQwordInSections(const std::vector<std::string>& names, uint64_t target) const;
 
     uint64_t imageBase() const { return imageBase_; }
     const std::vector<uint8_t>& data() const { return data_; }
 
-    // diagnostic
     struct Diag {
         uint64_t codeReg = 0;
         uint64_t metaReg = 0;
@@ -102,15 +86,13 @@ public:
 private:
     std::vector<uint8_t> data_;
     ElfInfo elf_;
-    std::vector<ElfSection> sections_;
     uint64_t imageBase_ = 0;
-    uint64_t base_ = 0;   // runtime load base (from memory dump)
+    uint64_t base_ = 0;
     Diag diag_;
 
     uint64_t codeRegAddr_ = 0;
     uint64_t metaRegAddr_ = 0;
 
-    // parsed structures
     std::vector<Il2CppType> types_;
     std::map<uint64_t, size_t> typeByPtr_;
     std::vector<Il2CppGenericInst> genericInsts_;
@@ -119,7 +101,6 @@ private:
     std::vector<Il2CppCodeGenModule> codeGenModules_;
     std::map<std::string, size_t> codeGenModuleByName_;
 
-    // metadata registration fields we need
     uint64_t metadataRegistrationTypes_ = 0;
     uint64_t metadataRegistrationTypesCount_ = 0;
     uint64_t metadataRegistrationGenericInsts_ = 0;
