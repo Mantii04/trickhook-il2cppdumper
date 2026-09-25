@@ -127,6 +127,7 @@ namespace Il2CppDumper
             var il2cppBytes = File.ReadAllBytes(il2cppPath);
             var unpack = FFProtector.TryUnpack(il2cppBytes, config.UnpackProtected, il2cppPath);
             FFProtector.Report(unpack);
+            FFProtector.Handled = unpack.ChecksumVerified;
             il2cppBytes = unpack.Data;
             var il2cppMagic = BitConverter.ToUInt32(il2cppBytes, 0);
             var il2CppMemory = new MemoryStream(il2cppBytes);

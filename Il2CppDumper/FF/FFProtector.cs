@@ -41,6 +41,11 @@ namespace Il2CppDumper
     {
         public const uint Magic = 0x12345678;
 
+        /// Setado quando o desempacotamento rodou e o CRC32 do descritor
+        /// fechou. A partir dai o aviso de "file may be protected" do upstream
+        /// so confunde: a protecao ja foi tratada.
+        public static bool Handled;
+
         /// Constante do packer que ofusca os parametros do descritor. Ela
         /// transforma o blob de chave em big-endian 0x20240829 (a data de build
         /// do packer) seguido de dois 1s - e a unica das 256 candidatas que faz

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -47,7 +47,7 @@ namespace Il2CppDumper
             if (!IsDumped)
             {
                 RelocationProcessing();
-                if (CheckProtection())
+                if (CheckProtection() && !FFProtector.Handled)
                 {
                     Console.WriteLine("ERROR: This file may be protected.");
                 }
@@ -279,7 +279,7 @@ namespace Il2CppDumper
                 //.init_proc
                 if (dynamicSection.Any(x => x.d_tag == DT_INIT))
                 {
-                    Console.WriteLine("WARNING: find .init_proc");
+                    if (!FFProtector.Handled) Console.WriteLine("WARNING: find .init_proc");
                     return true;
                 }
                 //JNI_OnLoad
@@ -290,7 +290,7 @@ namespace Il2CppDumper
                     switch (name)
                     {
                         case "JNI_OnLoad":
-                            Console.WriteLine("WARNING: find JNI_OnLoad");
+                            if (!FFProtector.Handled) Console.WriteLine("WARNING: find JNI_OnLoad");
                             return true;
                     }
                 }
