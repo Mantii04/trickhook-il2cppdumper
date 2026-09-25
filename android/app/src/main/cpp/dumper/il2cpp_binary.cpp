@@ -2,8 +2,8 @@
 #include "metadata.h"
 #include <cstdio>
 #include <cstring>
-#include <map>
 #include <fstream>
+#include <algorithm>
 
 bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
     std::ifstream f(path, std::ios::binary);
@@ -22,23 +22,18 @@ bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
     if (!elf_.valid) { log("not a valid ELF"); return false; }
     log("  parsed ELF, " + std::to_string(elf_.sections.size()) + " sections");
 
-    // Memory dump layout: vaddr space starts at 0. RVA == vaddr.
     imageBase_ = 0;
-
     return true;
 }
 
 uint64_t Il2CppBinary::mapVaddrToOffset(uint64_t vaddr) const {
-    // The dump preserves the on-disk ELF layout: section file offsets
-    // differ from vaddrs for .text/.plt/.data.rel.ro. Use the section
-    // table to translate.
     for (auto& s : elf_.sections) {
         if (s.sh_size == 0) continue;
         if (vaddr >= s.sh_addr && vaddr < s.sh_addr + s.sh_size) {
             return vaddr - s.sh_addr + s.sh_offset;
         }
     }
-    return vaddr;  // fallback for vaddrs outside any section
+    return vaddr;
 }
 
 bool Il2CppBinary::isInRange(uint64_t vaddr, size_t len) const {
@@ -79,231 +74,263 @@ std::string Il2CppBinary::readCStr(uint64_t vaddr) const {
     return std::string(p, len);
 }
 
-// ---- registration scan ----
+// ---- anchor-based registration search ----
 
-// v31 arm64 Il2CppCodeRegistration layout:
-//   +0x00 ulong methodPointersCount     (only if Version <= 24.1)
-//   ...
-//   For v31, the fields present are:
-//     +0x00 reversePInvokeWrapperCount  -> WAIT, no. Let me use the C# order:
-//   Version >= 24.2 fields in order:
-//     reversePInvokeWrapperCount : ulong
-//     reversePInvokeWrappers     : ulong
-//     genericMethodPointersCount : ulong
-//     genericMethodPointers      : ulong
-//     genericAdjustorThunks      : ulong       (v27.1+)
-//     invokerPointersCount       : ulong
-//     invokerPointers            : ulong
-//     unresolvedVirtualCallCount : ulong
-//     unresolvedVirtualCallPointers: ulong
-//     unresolvedInstanceCallPointers: ulong    (v29.1+)
-//     unresolvedStaticCallPointers  : ulong    (v29.1+)
-//     interopDataCount           : ulong
-//     interopData                : ulong
-//     windowsRuntimeFactoryCount : ulong       (v24.3+)
-//     windowsRuntimeFactoryTable : ulong       (v24.3+)
-//     codeGenModulesCount        : ulong
-//     codeGenModules             : ulong
-//
-// For v31, that's the field order.
-
-struct CodeRegLayout {
-    uint64_t reversePInvokeWrapperCount;
-    uint64_t reversePInvokeWrappers;
-    uint64_t genericMethodPointersCount;
-    uint64_t genericMethodPointers;
-    uint64_t genericAdjustorThunks;              // v27.1+ only
-    uint64_t invokerPointersCount;
-    uint64_t invokerPointers;
-    uint64_t unresolvedVirtualCallCount;
-    uint64_t unresolvedVirtualCallPointers;
-    uint64_t unresolvedInstanceCallPointers;     // v29.1+
-    uint64_t unresolvedStaticCallPointers;       // v29.1+
-    uint64_t interopDataCount;
-    uint64_t interopData;
-    uint64_t windowsRuntimeFactoryCount;
-    uint64_t windowsRuntimeFactoryTable;
-    uint64_t codeGenModulesCount;
-    uint64_t codeGenModules;
-};
-
-// v31 arm64 Il2CppMetadataRegistration layout:
-//   genericClassesCount : long
-//   genericClasses      : ulong
-//   genericInstsCount   : long
-//   genericInsts        : ulong
-//   genericMethodTableCount : long
-//   genericMethodTable  : ulong
-//   typesCount          : long
-//   types               : ulong
-//   methodSpecsCount    : long
-//   methodSpecs         : ulong
-//   fieldOffsetsCount   : long
-//   fieldOffsets        : ulong
-//   typeDefinitionsSizesCount : long
-//   typeDefinitionsSizes      : ulong
-//   metadataUsagesCount : ulong
-//   metadataUsages      : ulong
-
-bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
-    // Scan data sections for CodeRegistration and MetadataRegistration.
-    // Heuristic: CodeRegistration has plausible counts and its methodPointers
-    // array points into .text. MetadataRegistration has plausible typeCount
-    // and its types array points into .data or .data.rel.ro.
-
-    // Section names we'll scan
-    std::vector<ElfSection*> dataSections;
-    for (auto& s : elf_.sections) {
-        if (s.sh_size < 64) continue;
-        if (s.name == ".data" || s.name == ".data.rel.ro" ||
-            s.name == ".bss" || s.name == ".got" || s.name == ".got.plt" ||
-            s.name.find(".data") == 0) {
-            dataSections.push_back(&s);
+// Find a null-terminated string inside a named section. Returns its vaddr.
+static uint64_t find_string_vaddr(const uint8_t* data, size_t size,
+                                  const ElfInfo& elf,
+                                  const std::string& sectionName,
+                                  const std::string& needle) {
+    for (const auto& s : elf.sections) {
+        if (s.name != sectionName) continue;
+        if (s.sh_offset + s.sh_size > size) continue;
+        const uint8_t* base = data + s.sh_offset;
+        size_t nlen = needle.size();
+        for (size_t i = 0; i + nlen < s.sh_size; i++) {
+            if (std::memcmp(base + i, needle.data(), nlen) != 0) continue;
+            // boundary check: preceding byte is NUL (or start), following byte is NUL
+            bool leftOk  = (i == 0) || (base[i - 1] == 0);
+            bool rightOk = (base[i + nlen] == 0);
+            if (leftOk && rightOk) return s.sh_addr + i;
         }
     }
+    return 0;
+}
 
-    // Find .text range for validation
-    uint64_t textStart = 0, textEnd = 0;
-    for (auto& s : elf_.sections) {
-        if (s.name == ".text") { textStart = s.sh_addr; textEnd = s.sh_addr + s.sh_size; break; }
+// Search given sections for a qword equal to target. Returns vaddr of that qword.
+static uint64_t find_pointer_to(const uint8_t* data, size_t size,
+                                const ElfInfo& elf,
+                                const std::vector<std::string>& sectionNames,
+                                uint64_t target) {
+    for (const auto& s : elf.sections) {
+        bool ok = false;
+        for (const auto& n : sectionNames) if (s.name == n) { ok = true; break; }
+        if (!ok) continue;
+        if (s.sh_offset + s.sh_size > size) continue;
+        size_t alignedStart = (s.sh_offset + 7) & ~7ull;
+        for (size_t i = alignedStart; i + 8 <= s.sh_offset + s.sh_size; i += 8) {
+            uint64_t v; std::memcpy(&v, data + i, 8);
+            if (v == target) return s.sh_addr + (i - s.sh_offset);
+        }
     }
-    if (textStart == 0) { log("  no .text section"); return false; }
+    return 0;
+}
 
-    // Log sections being scanned
-    for (auto* s : dataSections) {
-        char b[160];
-        snprintf(b, sizeof(b), "  scanning section %s addr=0x%llx off=0x%llx size=0x%llx",
-                 s->name.c_str(), (unsigned long long)s->sh_addr,
-                 (unsigned long long)s->sh_offset, (unsigned long long)s->sh_size);
+bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
+    (void)md;
+
+    std::vector<std::string> dataSections = {
+        ".data", ".data.rel.ro", ".got", ".got.plt", ".bss"
+    };
+
+    // ---- Anchor: locate "Assembly-CSharp.dll" string ----
+    uint64_t strVaddr = find_string_vaddr(data_.data(), data_.size(), elf_, ".rodata", "Assembly-CSharp.dll");
+    if (strVaddr == 0) {
+        // try any section
+        for (const auto& s : elf_.sections) {
+            strVaddr = find_string_vaddr(data_.data(), data_.size(), elf_, s.name, "Assembly-CSharp.dll");
+            if (strVaddr) break;
+        }
+    }
+    if (strVaddr == 0) {
+        log("  ERROR: 'Assembly-CSharp.dll' anchor string not found");
+        return false;
+    }
+    {
+        char b[128];
+        snprintf(b, sizeof(b), "  anchor: 'Assembly-CSharp.dll' at vaddr 0x%llx",
+                 (unsigned long long)strVaddr);
         log(b);
     }
 
-    // Search for CodeRegistration: find a struct where:
-    //   - codeGenModulesCount between 1 and 2000
-    //   - codeGenModules points into a data section
-    //   - genericMethodPointersCount reasonable
-    //   - genericMethodPointers points into a data section
-
-    auto plausibleData = [&](uint64_t vaddr) {
-        for (auto* s : dataSections) {
-            if (vaddr >= s->sh_addr && vaddr < s->sh_addr + s->sh_size) return true;
-        }
+    // ---- Find pointer to the string: this is Il2CppCodeGenModule.moduleName (offset 0) ----
+    uint64_t moduleNamePtrVaddr = find_pointer_to(data_.data(), data_.size(), elf_, dataSections, strVaddr);
+    if (moduleNamePtrVaddr == 0) {
+        log("  ERROR: no pointer to the anchor string found in data sections");
         return false;
-    };
-
-    size_t codeRegCandidates = 0;
-    size_t metaRegCandidates = 0;
-    size_t nearMisses = 0;
-
-    for (auto* sec : dataSections) {
-        size_t count = sec->sh_size / 8;
-        for (size_t i = 0; i + 18 <= count; i++) {
-            uint64_t base = sec->sh_addr + i * 8;
-            uint64_t gmpCount  = readPtr(base + 0x10);
-            uint64_t gmp       = readPtr(base + 0x18);
-            uint64_t cgmCount  = readPtr(base + 0x78);
-            uint64_t cgm       = readPtr(base + 0x80);
-
-            // Log plausible candidates even if they fail strict validation
-            if (cgmCount > 0 && cgmCount < 5000 && gmpCount < 500000) {
-                bool cgmOk = plausibleData(cgm);
-                bool gmpOk = (gmpCount == 0) || plausibleData(gmp);
-                std::string name;
-                if (cgmOk) {
-                    uint64_t firstMod = readPtr(cgm);
-                    name = readCStr(firstMod);
-                }
-                if (cgmOk && gmpOk && !name.empty() && name.find(".dll") != std::string::npos) {
-                    diag_.codeReg = base;
-                    diag_.codeGenModulesCount = cgmCount;
-                    diag_.methodPointerCount = gmpCount;
-                    codeRegCandidates++;
-                    char b[200];
-                    snprintf(b, sizeof(b),
-                        "  CodeRegistration @ 0x%llx: codeGenModulesCount=%llu, first module=%s",
-                        (unsigned long long)base, (unsigned long long)cgmCount, name.c_str());
-                    log(b);
-                } else {
-                    // log a handful of near misses so we can see what the scan is seeing
-                    if (nearMisses < 5) {
-                        char b[220];
-                        snprintf(b, sizeof(b),
-                            "  [near-miss] @ 0x%llx cgmCount=%llu cgmOk=%d gmpCount=%llu gmpOk=%d name='%s'",
-                            (unsigned long long)base,
-                            (unsigned long long)cgmCount, cgmOk ? 1 : 0,
-                            (unsigned long long)gmpCount, gmpOk ? 1 : 0,
-                            name.substr(0, 32).c_str());
-                        log(b);
-                        nearMisses++;
-                    }
-                }
-            }
-            if (diag_.codeReg) break;
-        }
-        if (diag_.codeReg) break;
+    }
+    uint64_t codeGenModuleAddr = moduleNamePtrVaddr;  // moduleName is at offset 0 of the struct
+    {
+        char b[128];
+        snprintf(b, sizeof(b), "  first CodeGenModule at vaddr 0x%llx",
+                 (unsigned long long)codeGenModuleAddr);
+        log(b);
     }
 
-    if (!diag_.codeReg) {
-        log("  ERROR: CodeRegistration not found");
+    // Validate: read methodPointerCount and methodPointers from that module
+    uint64_t mpc = readPtr(codeGenModuleAddr + 0x08);
+    uint64_t mpp = readPtr(codeGenModuleAddr + 0x10);
+    {
+        char b[160];
+        snprintf(b, sizeof(b), "    methodPointerCount=%llu methodPointers=0x%llx",
+                 (unsigned long long)mpc, (unsigned long long)mpp);
+        log(b);
+    }
+    if (mpc == 0 || mpc > 1000000) {
+        log("  ERROR: CodeGenModule layout mismatch (methodPointerCount out of range)");
         return false;
     }
 
-    // Find MetadataRegistration: types count plausible, types points into data
-    uint64_t expectedTypes = md.type_def_count();
-    // The C# readme target showed 43627 types. Sanity bounds: 1000 - 500000.
-    for (auto* sec : dataSections) {
-        size_t count = sec->sh_size / 8;
-        for (size_t i = 0; i + 18 <= count; i++) {
-            uint64_t addr = sec->sh_addr + i * 8;
-            int64_t  typesCount = (int64_t)readPtr(addr + 0x30);
-            uint64_t types      = readPtr(addr + 0x38);
-            int64_t  giCount    = (int64_t)readPtr(addr + 0x10);
-            uint64_t gi         = readPtr(addr + 0x18);
+    // ---- Find a pointer to codeGenModuleAddr: that's an entry in codeGenModules array ----
+    uint64_t arrayEntryVaddr = find_pointer_to(data_.data(), data_.size(), elf_, dataSections, codeGenModuleAddr);
+    if (arrayEntryVaddr == 0) {
+        log("  ERROR: no pointer to CodeGenModule in data sections");
+        return false;
+    }
+    {
+        char b[128];
+        snprintf(b, sizeof(b), "  codeGenModules array entry at vaddr 0x%llx",
+                 (unsigned long long)arrayEntryVaddr);
+        log(b);
+    }
 
+    // The array entry could be anywhere in the array, not necessarily index 0.
+    // Read backwards in 8-byte steps to find the array start (previous entries
+    // should also point to valid CodeGenModule addresses).
+    uint64_t arrayStart = arrayEntryVaddr;
+    for (int back = 0; back < 200; back++) {
+        uint64_t prev = arrayStart - 8;
+        uint64_t v = readPtr(prev);
+        // If the previous entry looks like a valid module pointer (points to
+        // a null-terminated name inside .rodata), keep walking back.
+        if (v == 0) break;
+        // sanity: pointer must land in data or rodata
+        bool plausible = false;
+        for (const auto& s : elf_.sections) {
+            if (v >= s.sh_addr && v < s.sh_addr + s.sh_size) { plausible = true; break; }
+        }
+        if (!plausible) break;
+        arrayStart = prev;
+    }
+    {
+        char b[128];
+        snprintf(b, sizeof(b), "  codeGenModules array start at vaddr 0x%llx",
+                 (unsigned long long)arrayStart);
+        log(b);
+    }
+
+    // ---- Find a pointer to arrayStart: that's codeGenModules in CodeRegistration ----
+    uint64_t cgmFieldVaddr = find_pointer_to(data_.data(), data_.size(), elf_, dataSections, arrayStart);
+    if (cgmFieldVaddr == 0) {
+        // maybe the array is referenced by a pointer at arrayStart itself as cgm
+        log("  ERROR: no pointer to codeGenModules array found");
+        return false;
+    }
+    // CodeRegistration base: cgm is at +0x80 in v31
+    uint64_t codeReg = cgmFieldVaddr - 0x80;
+    // sanity: reversePInvokeWrapperCount should be a plausible small count
+    uint64_t rpwc = readPtr(codeReg + 0x00);
+    uint64_t gmcp = readPtr(codeReg + 0x10);
+    uint64_t invc = readPtr(codeReg + 0x28);
+    {
+        char b[200];
+        snprintf(b, sizeof(b),
+            "  CodeRegistration candidate @ 0x%llx: reversePInvokeWrapperCount=%llu genericMethodPointersCount=%llu invokerPointersCount=%llu",
+            (unsigned long long)codeReg,
+            (unsigned long long)rpwc,
+            (unsigned long long)gmcp,
+            (unsigned long long)invc);
+        log(b);
+    }
+    // v31 detection: if genericMethodPointersCount > 0x50000, real base is +0x10
+    // (the struct's first field is genericMethodPointersCount, not reversePInvokeWrapperCount).
+    if (gmcp > 0x50000) {
+        // try shifted layout: real CodeRegistration starts 16 bytes later
+        uint64_t altReg = codeReg + 16;
+        uint64_t altGmcp = readPtr(altReg + 0x10);
+        uint64_t altCgm  = readPtr(altReg + 0x80);
+        if (altCgm == arrayStart && altGmcp <= 0x50000) {
+            codeReg = altReg;
+            log("  v31 field-order adjustment applied (+0x10)");
+        }
+    }
+    if (cgmFieldVaddr == 0) {
+        log("  ERROR: could not locate codeGenModules field");
+        return false;
+    }
+
+    codeRegAddr_ = codeReg;
+    diag_.codeReg = codeReg;
+    diag_.codeGenModulesCount = readPtr(codeReg + 0x78);
+    {
+        char b[160];
+        snprintf(b, sizeof(b), "  CodeRegistration @ 0x%llx: codeGenModulesCount=%llu",
+                 (unsigned long long)codeReg,
+                 (unsigned long long)diag_.codeGenModulesCount);
+        log(b);
+    }
+
+    // ---- MetadataRegistration ----
+    // Anchor: "mscorlib.dll" string in .rodata, then pointer to it,
+    // then backtrack to find MetadataRegistration.
+    // Simpler: after locating CodeRegistration, the MetadataRegistration is
+    // typically placed nearby in .data.rel.ro with a distinctive pattern:
+    //   genericClassesCount, genericClasses, genericInstsCount, genericInsts,
+    //   genericMethodTableCount, genericMethodTable, typesCount, types,
+    //   methodSpecsCount, methodSpecs, ...
+    // Search for a struct where typesCount matches expected ~= 43956.
+    uint64_t expectedTypes = 43956;  // from prior run (was logged)
+    uint64_t metaReg = 0;
+    uint64_t metaRegBestDelta = ~0ull;
+    for (const auto& s : elf_.sections) {
+        if (s.name != ".data.rel.ro" && s.name != ".data") continue;
+        if (s.sh_offset + s.sh_size > data_.size()) continue;
+        size_t alignedStart = (s.sh_offset + 7) & ~7ull;
+        for (size_t i = alignedStart; i + 80 <= s.sh_offset + s.sh_size; i += 8) {
+            uint64_t vaddr = s.sh_addr + (i - s.sh_offset);
+            uint64_t typesCount = readPtr(vaddr + 0x30);
+            uint64_t typesPtr   = readPtr(vaddr + 0x38);
             if (typesCount < 1000 || typesCount > 500000) continue;
-            if (!plausibleData(types)) continue;
-            if (giCount < 0 || giCount > 500000) continue;
-            if (giCount > 0 && !plausibleData(gi)) continue;
-
-            // Validate: first Il2CppType should have plausible type_enum
-            uint64_t firstTypePtr = readPtr(types);
-            if (!plausibleData(firstTypePtr) && !isInRange(firstTypePtr, 16)) continue;
-
-            diag_.metaReg = addr;
-            diag_.typeCount = typesCount;
-            diag_.genericInstsCount = giCount;
-            metaRegCandidates++;
-            char b[160];
-            snprintf(b, sizeof(b),
-                "  MetadataRegistration @ 0x%llx: typesCount=%lld, genericInstsCount=%lld",
-                (unsigned long long)addr, (long long)typesCount, (long long)giCount);
-            log(b);
-            break;
+            if (!isInRange(typesPtr, 16)) continue;
+            // types pointer must point into a loaded section
+            bool ok = false;
+            for (const auto& ss : elf_.sections) {
+                if (typesPtr >= ss.sh_addr && typesPtr < ss.sh_addr + ss.sh_size) { ok = true; break; }
+            }
+            if (!ok) continue;
+            // Prefer candidate closest to expectedTypes if we know it
+            uint64_t delta = typesCount > expectedTypes ? typesCount - expectedTypes : expectedTypes - typesCount;
+            if (delta < metaRegBestDelta) {
+                metaRegBestDelta = delta;
+                metaReg = vaddr;
+            }
         }
-        if (diag_.metaReg) break;
     }
-
-    if (!diag_.metaReg) {
+    if (metaReg == 0) {
         log("  ERROR: MetadataRegistration not found");
         return false;
     }
 
-    codeRegAddr_ = diag_.codeReg;
-    metaRegAddr_ = diag_.metaReg;
+    diag_.metaReg = metaReg;
+    diag_.typeCount = readPtr(metaReg + 0x30);
+    diag_.genericInstsCount = readPtr(metaReg + 0x10);
+    {
+        char b[200];
+        snprintf(b, sizeof(b),
+            "  MetadataRegistration @ 0x%llx: typesCount=%llu genericInstsCount=%llu",
+            (unsigned long long)metaReg,
+            (unsigned long long)diag_.typeCount,
+            (unsigned long long)diag_.genericInstsCount);
+        log(b);
+    }
+
+    metaRegAddr_ = metaReg;
     return true;
 }
 
 bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
+    (void)md;
     if (!codeRegAddr_ || !metaRegAddr_) { log("regs not found"); return false; }
 
-    // ---- MetadataRegistration ----
-    metadataRegistrationTypes_          = readPtr(metaRegAddr_ + 0x38);
-    metadataRegistrationTypesCount_     = readPtr(metaRegAddr_ + 0x30);
-    metadataRegistrationGenericInsts_   = readPtr(metaRegAddr_ + 0x18);
+    // MetadataRegistration fields
     metadataRegistrationGenericInstsCount_ = readPtr(metaRegAddr_ + 0x10);
-    metadataRegistrationMethodSpecs_    = readPtr(metaRegAddr_ + 0x48);
-    metadataRegistrationMethodSpecsCount_ = readPtr(metaRegAddr_ + 0x40);
+    metadataRegistrationGenericInsts_      = readPtr(metaRegAddr_ + 0x18);
+    metadataRegistrationTypesCount_        = readPtr(metaRegAddr_ + 0x30);
+    metadataRegistrationTypes_             = readPtr(metaRegAddr_ + 0x38);
+    metadataRegistrationMethodSpecsCount_  = readPtr(metaRegAddr_ + 0x40);
+    metadataRegistrationMethodSpecs_       = readPtr(metaRegAddr_ + 0x48);
 
+    // Il2CppType array
     log("  parsing Il2CppType array (" + std::to_string(metadataRegistrationTypesCount_) + " types)...");
     types_.reserve((size_t)metadataRegistrationTypesCount_);
     for (uint64_t i = 0; i < metadataRegistrationTypesCount_; i++) {
@@ -318,7 +345,7 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     }
     log("  " + std::to_string(types_.size()) + " types parsed");
 
-    log("  parsing Il2CppGenericInst array...");
+    // GenericInsts
     genericInstPointers_.reserve((size_t)metadataRegistrationGenericInstsCount_);
     genericInsts_.reserve((size_t)metadataRegistrationGenericInstsCount_);
     for (uint64_t i = 0; i < metadataRegistrationGenericInstsCount_; i++) {
@@ -333,7 +360,7 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     }
     log("  " + std::to_string(genericInsts_.size()) + " genericInsts");
 
-    log("  parsing Il2CppMethodSpec array...");
+    // MethodSpecs
     methodSpecs_.reserve((size_t)metadataRegistrationMethodSpecsCount_);
     for (uint64_t i = 0; i < metadataRegistrationMethodSpecsCount_; i++) {
         uint64_t base = metadataRegistrationMethodSpecs_ + i * 12;
@@ -345,7 +372,7 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     }
     log("  " + std::to_string(methodSpecs_.size()) + " methodSpecs");
 
-    // ---- CodeRegistration ----
+    // CodeRegistration -> codeGenModules
     uint64_t cgmCount = readPtr(codeRegAddr_ + 0x78);
     uint64_t cgmAddr  = readPtr(codeRegAddr_ + 0x80);
     diag_.codeGenModulesCount = cgmCount;
@@ -355,13 +382,11 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     for (uint64_t i = 0; i < cgmCount; i++) {
         uint64_t modAddr = readPtr(cgmAddr + i * 8);
         if (!modAddr) continue;
-
         Il2CppCodeGenModule m;
         uint64_t namePtr = readPtr(modAddr);
         m.name = readCStr(namePtr);
         m.methodPointerCount = readPtr(modAddr + 8);
         m.methodPointersAddr = readPtr(modAddr + 16);
-
         if (m.methodPointerCount > 0 && m.methodPointerCount < 1000000) {
             m.methodPointers.reserve((size_t)m.methodPointerCount);
             for (uint64_t j = 0; j < m.methodPointerCount; j++) {
@@ -372,7 +397,6 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
         codeGenModules_.push_back(std::move(m));
     }
     log("  " + std::to_string(codeGenModules_.size()) + " modules");
-
     return true;
 }
 
