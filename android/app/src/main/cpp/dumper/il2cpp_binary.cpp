@@ -2,8 +2,57 @@
 #include "metadata.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <cctype>
 #include <fstream>
 #include <algorithm>
+
+// parse base from filename: *-<hex>-<hex>.bin
+// e.g. "com.dts.freefiremax-75d3a81000-75f25ca000.bin" -> 0x75d3a81000
+static uint64_t parse_base_from_path(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    size_t lastDot = name.find_last_of('.');
+    if (lastDot != std::string::npos) name = name.substr(0, lastDot);
+    size_t lastDash = name.find_last_of('-');
+    if (lastDash == std::string::npos) return 0;
+    size_t prevDash = name.find_last_of('-', lastDash - 1);
+    if (prevDash == std::string::npos) return 0;
+    std::string hexA = name.substr(prevDash + 1, lastDash - prevDash - 1);
+    if (hexA.empty() || hexA.size() > 16) return 0;
+    for (char c : hexA) if (!isxdigit((unsigned char)c)) return 0;
+    return std::strtoull(hexA.c_str(), nullptr, 16);
+}
+
+// detect base by looking at .init_array entries — they hold runtime pointers into .text
+static uint64_t detect_base_from_init_array(const std::vector<uint8_t>& data, const ElfInfo& elf) {
+    const ElfSection* initArr = nullptr;
+    for (const auto& s : elf.sections) if (s.name == ".init_array") { initArr = &s; break; }
+    if (!initArr || initArr->sh_size < 16) return 0;
+
+    std::vector<uint64_t> entries;
+    for (size_t i = 0; i + 8 <= initArr->sh_size; i += 8) {
+        size_t off = initArr->sh_offset + i;
+        if (off + 8 > data.size()) break;
+        uint64_t v; std::memcpy(&v, data.data() + off, 8);
+        if (v > 0x100000000ull && v < 0x800000000000ull) entries.push_back(v);
+    }
+    if (entries.size() < 2) return 0;
+
+    uint64_t mn = *std::min_element(entries.begin(), entries.end());
+    // candidate: Y such that every entry - Y is < 256 MB
+    for (uint64_t delta = 0; delta < 0x20000000ull; delta += 0x1000) {
+        uint64_t Y = (mn & ~0xFFFull) - delta;
+        if (Y == 0) break;
+        bool ok = true;
+        for (uint64_t e : entries) {
+            uint64_t norm = e - Y;
+            if (norm > 0x10000000ull) { ok = false; break; }
+        }
+        if (ok) return Y;
+    }
+    return 0;
+}
 
 bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
     std::ifstream f(path, std::ios::binary);
@@ -22,18 +71,35 @@ bool Il2CppBinary::load(const std::string& path, const LogFn& log) {
     if (!elf_.valid) { log("not a valid ELF"); return false; }
     log("  parsed ELF, " + std::to_string(elf_.sections.size()) + " sections");
 
-    imageBase_ = 0;
+    // Runtime base: parse from filename, fall back to .init_array heuristic
+    base_ = parse_base_from_path(path);
+    if (base_ == 0) {
+        base_ = detect_base_from_init_array(data_, elf_);
+        if (base_ != 0) log("  base detected from .init_array");
+    }
+    if (base_ == 0) {
+        log("  WARN: no runtime base detected — assuming dump is normalized");
+        base_ = 0;
+    }
+    {
+        char b[64];
+        snprintf(b, sizeof(b), "  runtime base = 0x%llx", (unsigned long long)base_);
+        log(b);
+    }
+    imageBase_ = base_;
     return true;
 }
 
-uint64_t Il2CppBinary::mapVaddrToOffset(uint64_t vaddr) const {
+uint64_t Il2CppBinary::mapVaddrToOffset(uint64_t runtimeVaddr) const {
+    // runtime vaddr -> normalized vaddr -> file offset via sections
+    uint64_t v = runtimeVaddr - base_;
     for (auto& s : elf_.sections) {
         if (s.sh_size == 0) continue;
-        if (vaddr >= s.sh_addr && vaddr < s.sh_addr + s.sh_size) {
-            return vaddr - s.sh_addr + s.sh_offset;
+        if (v >= s.sh_addr && v < s.sh_addr + s.sh_size) {
+            return v - s.sh_addr + s.sh_offset;
         }
     }
-    return vaddr;
+    return v;
 }
 
 bool Il2CppBinary::isInRange(uint64_t vaddr, size_t len) const {
@@ -74,43 +140,40 @@ std::string Il2CppBinary::readCStr(uint64_t vaddr) const {
     return std::string(p, len);
 }
 
-// ---- anchor-based registration search ----
-
-// Find a null-terminated string inside a named section. Returns its vaddr.
-static uint64_t find_string_vaddr(const uint8_t* data, size_t size,
-                                  const ElfInfo& elf,
-                                  const std::string& sectionName,
-                                  const std::string& needle) {
+// Find a null-terminated string inside a named section. Returns its RUNTIME vaddr.
+static uint64_t find_string_runtime(const uint8_t* data, size_t size,
+                                    const ElfInfo& elf, uint64_t base,
+                                    const std::string& sectionName,
+                                    const std::string& needle) {
     for (const auto& s : elf.sections) {
         if (s.name != sectionName) continue;
         if (s.sh_offset + s.sh_size > size) continue;
-        const uint8_t* base = data + s.sh_offset;
+        const uint8_t* b = data + s.sh_offset;
         size_t nlen = needle.size();
         for (size_t i = 0; i + nlen < s.sh_size; i++) {
-            if (std::memcmp(base + i, needle.data(), nlen) != 0) continue;
-            // boundary check: preceding byte is NUL (or start), following byte is NUL
-            bool leftOk  = (i == 0) || (base[i - 1] == 0);
-            bool rightOk = (base[i + nlen] == 0);
-            if (leftOk && rightOk) return s.sh_addr + i;
+            if (std::memcmp(b + i, needle.data(), nlen) != 0) continue;
+            bool leftOk  = (i == 0) || (b[i - 1] == 0);
+            bool rightOk = (b[i + nlen] == 0);
+            if (leftOk && rightOk) return base + s.sh_addr + i;
         }
     }
     return 0;
 }
 
-// Search given sections for a qword equal to target. Returns vaddr of that qword.
-static uint64_t find_pointer_to(const uint8_t* data, size_t size,
-                                const ElfInfo& elf,
-                                const std::vector<std::string>& sectionNames,
-                                uint64_t target) {
+// Search sections for a qword equal to target. Returns RUNTIME vaddr of the qword.
+static uint64_t find_pointer_runtime(const uint8_t* data, size_t size,
+                                     const ElfInfo& elf, uint64_t base,
+                                     const std::vector<std::string>& sectionNames,
+                                     uint64_t target) {
     for (const auto& s : elf.sections) {
         bool ok = false;
         for (const auto& n : sectionNames) if (s.name == n) { ok = true; break; }
         if (!ok) continue;
         if (s.sh_offset + s.sh_size > size) continue;
-        size_t alignedStart = (s.sh_offset + 7) & ~7ull;
-        for (size_t i = alignedStart; i + 8 <= s.sh_offset + s.sh_size; i += 8) {
+        size_t i = (s.sh_offset + 7) & ~7ull;
+        for (; i + 8 <= s.sh_offset + s.sh_size; i += 8) {
             uint64_t v; std::memcpy(&v, data + i, 8);
-            if (v == target) return s.sh_addr + (i - s.sh_offset);
+            if (v == target) return base + s.sh_addr + (i - s.sh_offset);
         }
     }
     return 0;
@@ -123,43 +186,44 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
         ".data", ".data.rel.ro", ".got", ".got.plt", ".bss"
     };
 
-    // ---- Anchor: locate "Assembly-CSharp.dll" string ----
-    uint64_t strVaddr = find_string_vaddr(data_.data(), data_.size(), elf_, ".rodata", "Assembly-CSharp.dll");
-    if (strVaddr == 0) {
-        // try any section
+    // Anchor string
+    uint64_t strRuntime = find_string_runtime(data_.data(), data_.size(),
+                                              elf_, base_, ".rodata", "Assembly-CSharp.dll");
+    if (strRuntime == 0) {
         for (const auto& s : elf_.sections) {
-            strVaddr = find_string_vaddr(data_.data(), data_.size(), elf_, s.name, "Assembly-CSharp.dll");
-            if (strVaddr) break;
+            strRuntime = find_string_runtime(data_.data(), data_.size(),
+                                             elf_, base_, s.name, "Assembly-CSharp.dll");
+            if (strRuntime) break;
         }
     }
-    if (strVaddr == 0) {
+    if (strRuntime == 0) {
         log("  ERROR: 'Assembly-CSharp.dll' anchor string not found");
         return false;
     }
     {
         char b[128];
-        snprintf(b, sizeof(b), "  anchor: 'Assembly-CSharp.dll' at vaddr 0x%llx",
-                 (unsigned long long)strVaddr);
+        snprintf(b, sizeof(b), "  anchor string runtime vaddr = 0x%llx",
+                 (unsigned long long)strRuntime);
         log(b);
     }
 
-    // ---- Find pointer to the string: this is Il2CppCodeGenModule.moduleName (offset 0) ----
-    uint64_t moduleNamePtrVaddr = find_pointer_to(data_.data(), data_.size(), elf_, dataSections, strVaddr);
-    if (moduleNamePtrVaddr == 0) {
-        log("  ERROR: no pointer to the anchor string found in data sections");
+    // Pointer to the string = first CodeGenModule.moduleName
+    uint64_t modRuntime = find_pointer_runtime(data_.data(), data_.size(),
+                                               elf_, base_, dataSections, strRuntime);
+    if (modRuntime == 0) {
+        log("  ERROR: no pointer to anchor string in data sections");
         return false;
     }
-    uint64_t codeGenModuleAddr = moduleNamePtrVaddr;  // moduleName is at offset 0 of the struct
     {
         char b[128];
-        snprintf(b, sizeof(b), "  first CodeGenModule at vaddr 0x%llx",
-                 (unsigned long long)codeGenModuleAddr);
+        snprintf(b, sizeof(b), "  first CodeGenModule runtime = 0x%llx",
+                 (unsigned long long)modRuntime);
         log(b);
     }
 
-    // Validate: read methodPointerCount and methodPointers from that module
-    uint64_t mpc = readPtr(codeGenModuleAddr + 0x08);
-    uint64_t mpp = readPtr(codeGenModuleAddr + 0x10);
+    // module: +0x00 name ptr, +0x08 methodPointerCount, +0x10 methodPointers ptr
+    uint64_t mpc = readPtr(modRuntime + 0x08);
+    uint64_t mpp = readPtr(modRuntime + 0x10);
     {
         char b[160];
         snprintf(b, sizeof(b), "    methodPointerCount=%llu methodPointers=0x%llx",
@@ -167,86 +231,73 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
         log(b);
     }
     if (mpc == 0 || mpc > 1000000) {
-        log("  ERROR: CodeGenModule layout mismatch (methodPointerCount out of range)");
+        log("  ERROR: CodeGenModule methodPointerCount out of range");
         return false;
     }
 
-    // ---- Find a pointer to codeGenModuleAddr: that's an entry in codeGenModules array ----
-    uint64_t arrayEntryVaddr = find_pointer_to(data_.data(), data_.size(), elf_, dataSections, codeGenModuleAddr);
-    if (arrayEntryVaddr == 0) {
+    // Find pointer to modRuntime -> entry in codeGenModules array
+    uint64_t arrEntry = find_pointer_runtime(data_.data(), data_.size(),
+                                             elf_, base_, dataSections, modRuntime);
+    if (arrEntry == 0) {
         log("  ERROR: no pointer to CodeGenModule in data sections");
         return false;
     }
     {
         char b[128];
-        snprintf(b, sizeof(b), "  codeGenModules array entry at vaddr 0x%llx",
-                 (unsigned long long)arrayEntryVaddr);
+        snprintf(b, sizeof(b), "  codeGenModules array entry runtime = 0x%llx",
+                 (unsigned long long)arrEntry);
         log(b);
     }
 
-    // The array entry could be anywhere in the array, not necessarily index 0.
-    // Read backwards in 8-byte steps to find the array start (previous entries
-    // should also point to valid CodeGenModule addresses).
-    uint64_t arrayStart = arrayEntryVaddr;
-    for (int back = 0; back < 200; back++) {
-        uint64_t prev = arrayStart - 8;
+    // Walk back to find array start
+    uint64_t arrStart = arrEntry;
+    for (int back = 0; back < 500; back++) {
+        uint64_t prev = arrStart - 8;
         uint64_t v = readPtr(prev);
-        // If the previous entry looks like a valid module pointer (points to
-        // a null-terminated name inside .rodata), keep walking back.
         if (v == 0) break;
-        // sanity: pointer must land in data or rodata
+        // must land inside a loaded section (normalize by subtracting base)
+        uint64_t nv = v - base_;
         bool plausible = false;
         for (const auto& s : elf_.sections) {
-            if (v >= s.sh_addr && v < s.sh_addr + s.sh_size) { plausible = true; break; }
+            if (nv >= s.sh_addr && nv < s.sh_addr + s.sh_size) { plausible = true; break; }
         }
         if (!plausible) break;
-        arrayStart = prev;
+        arrStart = prev;
     }
     {
         char b[128];
-        snprintf(b, sizeof(b), "  codeGenModules array start at vaddr 0x%llx",
-                 (unsigned long long)arrayStart);
+        snprintf(b, sizeof(b), "  codeGenModules array start runtime = 0x%llx",
+                 (unsigned long long)arrStart);
         log(b);
     }
 
-    // ---- Find a pointer to arrayStart: that's codeGenModules in CodeRegistration ----
-    uint64_t cgmFieldVaddr = find_pointer_to(data_.data(), data_.size(), elf_, dataSections, arrayStart);
-    if (cgmFieldVaddr == 0) {
-        // maybe the array is referenced by a pointer at arrayStart itself as cgm
-        log("  ERROR: no pointer to codeGenModules array found");
+    // Find pointer to arrStart: this is CodeRegistration.codeGenModules
+    uint64_t cgmFieldRuntime = find_pointer_runtime(data_.data(), data_.size(),
+                                                    elf_, base_, dataSections, arrStart);
+    if (cgmFieldRuntime == 0) {
+        log("  ERROR: no pointer to codeGenModules array");
         return false;
     }
-    // CodeRegistration base: cgm is at +0x80 in v31
-    uint64_t codeReg = cgmFieldVaddr - 0x80;
-    // sanity: reversePInvokeWrapperCount should be a plausible small count
-    uint64_t rpwc = readPtr(codeReg + 0x00);
-    uint64_t gmcp = readPtr(codeReg + 0x10);
-    uint64_t invc = readPtr(codeReg + 0x28);
+    // v31: codeGenModules is at +0x80
+    uint64_t codeReg = cgmFieldRuntime - 0x80;
     {
-        char b[200];
+        uint64_t rpwc = readPtr(codeReg + 0x00);
+        uint64_t gmcp = readPtr(codeReg + 0x10);
+        uint64_t invc = readPtr(codeReg + 0x28);
+        char b[220];
         snprintf(b, sizeof(b),
             "  CodeRegistration candidate @ 0x%llx: reversePInvokeWrapperCount=%llu genericMethodPointersCount=%llu invokerPointersCount=%llu",
             (unsigned long long)codeReg,
-            (unsigned long long)rpwc,
-            (unsigned long long)gmcp,
-            (unsigned long long)invc);
+            (unsigned long long)rpwc, (unsigned long long)gmcp, (unsigned long long)invc);
         log(b);
     }
-    // v31 detection: if genericMethodPointersCount > 0x50000, real base is +0x10
-    // (the struct's first field is genericMethodPointersCount, not reversePInvokeWrapperCount).
-    if (gmcp > 0x50000) {
-        // try shifted layout: real CodeRegistration starts 16 bytes later
-        uint64_t altReg = codeReg + 16;
-        uint64_t altGmcp = readPtr(altReg + 0x10);
-        uint64_t altCgm  = readPtr(altReg + 0x80);
-        if (altCgm == arrayStart && altGmcp <= 0x50000) {
-            codeReg = altReg;
-            log("  v31 field-order adjustment applied (+0x10)");
+    // sanity: cgm pointer at +0x80 must equal arrStart
+    if (readPtr(codeReg + 0x80) != arrStart) {
+        // Try +0x78 layout (v29.1 older)
+        if (readPtr(codeReg + 0x78) == arrStart) {
+            codeReg = cgmFieldRuntime - 0x78;
+            log("  adjusting CodeRegistration offset (-0x78)");
         }
-    }
-    if (cgmFieldVaddr == 0) {
-        log("  ERROR: could not locate codeGenModules field");
-        return false;
     }
 
     codeRegAddr_ = codeReg;
@@ -255,52 +306,38 @@ bool Il2CppBinary::findRegistrations(const Metadata& md, const LogFn& log) {
     {
         char b[160];
         snprintf(b, sizeof(b), "  CodeRegistration @ 0x%llx: codeGenModulesCount=%llu",
-                 (unsigned long long)codeReg,
-                 (unsigned long long)diag_.codeGenModulesCount);
+                 (unsigned long long)codeReg, (unsigned long long)diag_.codeGenModulesCount);
         log(b);
     }
 
-    // ---- MetadataRegistration ----
-    // Anchor: "mscorlib.dll" string in .rodata, then pointer to it,
-    // then backtrack to find MetadataRegistration.
-    // Simpler: after locating CodeRegistration, the MetadataRegistration is
-    // typically placed nearby in .data.rel.ro with a distinctive pattern:
-    //   genericClassesCount, genericClasses, genericInstsCount, genericInsts,
-    //   genericMethodTableCount, genericMethodTable, typesCount, types,
-    //   methodSpecsCount, methodSpecs, ...
-    // Search for a struct where typesCount matches expected ~= 43956.
-    uint64_t expectedTypes = 43956;  // from prior run (was logged)
+    // MetadataRegistration: search .data.rel.ro for struct with plausible typesCount
     uint64_t metaReg = 0;
-    uint64_t metaRegBestDelta = ~0ull;
+    uint64_t expectedTypes = 43956;
+    uint64_t bestDelta = ~0ull;
     for (const auto& s : elf_.sections) {
         if (s.name != ".data.rel.ro" && s.name != ".data") continue;
         if (s.sh_offset + s.sh_size > data_.size()) continue;
-        size_t alignedStart = (s.sh_offset + 7) & ~7ull;
-        for (size_t i = alignedStart; i + 80 <= s.sh_offset + s.sh_size; i += 8) {
-            uint64_t vaddr = s.sh_addr + (i - s.sh_offset);
-            uint64_t typesCount = readPtr(vaddr + 0x30);
-            uint64_t typesPtr   = readPtr(vaddr + 0x38);
+        size_t i = (s.sh_offset + 7) & ~7ull;
+        for (; i + 0x60 <= s.sh_offset + s.sh_size; i += 8) {
+            uint64_t runtimeAddr = base_ + s.sh_addr + (i - s.sh_offset);
+            uint64_t typesCount = readPtr(runtimeAddr + 0x30);
+            uint64_t typesPtr   = readPtr(runtimeAddr + 0x38);
             if (typesCount < 1000 || typesCount > 500000) continue;
-            if (!isInRange(typesPtr, 16)) continue;
-            // types pointer must point into a loaded section
+            // typesPtr must be runtime and land in a loaded section
+            uint64_t nv = typesPtr - base_;
             bool ok = false;
             for (const auto& ss : elf_.sections) {
-                if (typesPtr >= ss.sh_addr && typesPtr < ss.sh_addr + ss.sh_size) { ok = true; break; }
+                if (nv >= ss.sh_addr && nv < ss.sh_addr + ss.sh_size) { ok = true; break; }
             }
             if (!ok) continue;
-            // Prefer candidate closest to expectedTypes if we know it
             uint64_t delta = typesCount > expectedTypes ? typesCount - expectedTypes : expectedTypes - typesCount;
-            if (delta < metaRegBestDelta) {
-                metaRegBestDelta = delta;
-                metaReg = vaddr;
-            }
+            if (delta < bestDelta) { bestDelta = delta; metaReg = runtimeAddr; }
         }
     }
     if (metaReg == 0) {
         log("  ERROR: MetadataRegistration not found");
         return false;
     }
-
     diag_.metaReg = metaReg;
     diag_.typeCount = readPtr(metaReg + 0x30);
     diag_.genericInstsCount = readPtr(metaReg + 0x10);
@@ -322,7 +359,6 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     (void)md;
     if (!codeRegAddr_ || !metaRegAddr_) { log("regs not found"); return false; }
 
-    // MetadataRegistration fields
     metadataRegistrationGenericInstsCount_ = readPtr(metaRegAddr_ + 0x10);
     metadataRegistrationGenericInsts_      = readPtr(metaRegAddr_ + 0x18);
     metadataRegistrationTypesCount_        = readPtr(metaRegAddr_ + 0x30);
@@ -330,7 +366,6 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     metadataRegistrationMethodSpecsCount_  = readPtr(metaRegAddr_ + 0x40);
     metadataRegistrationMethodSpecs_       = readPtr(metaRegAddr_ + 0x48);
 
-    // Il2CppType array
     log("  parsing Il2CppType array (" + std::to_string(metadataRegistrationTypesCount_) + " types)...");
     types_.reserve((size_t)metadataRegistrationTypesCount_);
     for (uint64_t i = 0; i < metadataRegistrationTypesCount_; i++) {
@@ -345,7 +380,6 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     }
     log("  " + std::to_string(types_.size()) + " types parsed");
 
-    // GenericInsts
     genericInstPointers_.reserve((size_t)metadataRegistrationGenericInstsCount_);
     genericInsts_.reserve((size_t)metadataRegistrationGenericInstsCount_);
     for (uint64_t i = 0; i < metadataRegistrationGenericInstsCount_; i++) {
@@ -360,19 +394,17 @@ bool Il2CppBinary::parseRegistrations(const Metadata& md, const LogFn& log) {
     }
     log("  " + std::to_string(genericInsts_.size()) + " genericInsts");
 
-    // MethodSpecs
     methodSpecs_.reserve((size_t)metadataRegistrationMethodSpecsCount_);
     for (uint64_t i = 0; i < metadataRegistrationMethodSpecsCount_; i++) {
-        uint64_t base = metadataRegistrationMethodSpecs_ + i * 12;
+        uint64_t b = metadataRegistrationMethodSpecs_ + i * 12;
         Il2CppMethodSpec ms;
-        ms.methodDefinitionIndex = readI32(base + 0);
-        ms.classIndexIndex       = readI32(base + 4);
-        ms.methodIndexIndex      = readI32(base + 8);
+        ms.methodDefinitionIndex = readI32(b + 0);
+        ms.classIndexIndex       = readI32(b + 4);
+        ms.methodIndexIndex      = readI32(b + 8);
         methodSpecs_.push_back(ms);
     }
     log("  " + std::to_string(methodSpecs_.size()) + " methodSpecs");
 
-    // CodeRegistration -> codeGenModules
     uint64_t cgmCount = readPtr(codeRegAddr_ + 0x78);
     uint64_t cgmAddr  = readPtr(codeRegAddr_ + 0x80);
     diag_.codeGenModulesCount = cgmCount;

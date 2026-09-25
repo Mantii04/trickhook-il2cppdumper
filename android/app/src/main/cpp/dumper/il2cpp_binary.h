@@ -104,6 +104,7 @@ private:
     ElfInfo elf_;
     std::vector<ElfSection> sections_;
     uint64_t imageBase_ = 0;
+    uint64_t base_ = 0;   // runtime load base (from memory dump)
     Diag diag_;
 
     uint64_t codeRegAddr_ = 0;
