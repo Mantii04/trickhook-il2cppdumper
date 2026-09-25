@@ -76,9 +76,30 @@ bool ff_unpack(ElfInfo& elf, std::vector<uint8_t>& buf, const LogFn& log) {
         }
     }
     if (desc_off == SIZE_MAX) {
-        char buf[96];
+        char buf[160];
         snprintf(buf, sizeof(buf), "  no descriptor found (scanned %zu MB, %zu magic hits)",
                  size / 1024 / 1024, hits);
+        log(buf);
+        // Diagnostic: look for a second ELF header (appended stub is itself an ELF)
+        size_t second_elf = SIZE_MAX;
+        for (size_t i = 4; i + 4 <= size; i += 4) {
+            if (data[i] == 0x7f && data[i+1] == 'E' && data[i+2] == 'L' && data[i+3] == 'F') {
+                second_elf = i;
+                break;
+            }
+        }
+        if (second_elf != SIZE_MAX) {
+            snprintf(buf, sizeof(buf), "  second ELF header found at 0x%zx", second_elf);
+            log(buf);
+        } else {
+            log("  no second ELF header — .so is single-part");
+        }
+        // Diagnostic: first/last 16 bytes of file
+        snprintf(buf, sizeof(buf), "  tail16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                 data[size-16], data[size-15], data[size-14], data[size-13],
+                 data[size-12], data[size-11], data[size-10], data[size-9],
+                 data[size-8], data[size-7], data[size-6], data[size-5],
+                 data[size-4], data[size-3], data[size-2], data[size-1]);
         log(buf);
         log("  .so assumed already plaintext");
         return true;

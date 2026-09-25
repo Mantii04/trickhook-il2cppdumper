@@ -47,6 +47,41 @@ int run_dump(const std::string& so_path,
         return 6;
     }
 
+    // Diagnostic block
+    {
+        char b[200];
+        snprintf(b, sizeof(b), "  stringOffset=0x%x stringSize=0x%x methodsOffset=0x%x methodsSize=0x%x",
+                 md.header.stringOffset, md.header.stringSize,
+                 md.header.methodsOffset, md.header.methodsSize);
+        log(b);
+        log("  first 5 strings:");
+        for (int i = 0; i < 5; i++) {
+            int idx = i * 1024;
+            std::string s = md.read_string(idx);
+            snprintf(b, sizeof(b), "    idx=%d -> '%s'", idx, s.c_str());
+            log(b);
+        }
+        log("  first 8 methods (nameIdx, declType, token, flags, pcount):");
+        for (int i = 0; i < 8; i++) {
+            size_t off = (size_t)md.header.methodsOffset + (size_t)i * md.method_stride;
+            if (off + md.method_stride > meta.size()) break;
+            Reader r{meta.data(), meta.size()};
+            r.seek(off);
+            int32_t nameIdx = r.i32();
+            int32_t declType = r.i32();
+            r.seek(off + 24);
+            int32_t token = r.i32();
+            r.seek(off + md.method_stride - 8);
+            uint16_t flags = r.u16(); r.skip(2);
+            r.skip(2);
+            uint16_t pcount = r.u16();
+            std::string nm = md.read_string(nameIdx);
+            snprintf(b, sizeof(b), "    m[%d] nameIdx=%d declType=%d token=0x%x flags=0x%x pcount=%u name='%s'",
+                     i, nameIdx, declType, token, flags, pcount, nm.c_str());
+            log(b);
+        }
+    }
+
     std::string dump_path = out_dir + "/dump.cs";
     if (write_dump_cs(md, dump_path, log) != 0) return 7;
 
