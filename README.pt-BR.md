@@ -10,6 +10,19 @@ atualização.
 
 🇺🇸 [README.md](README.md) · Upstream: [README.upstream.md](README.upstream.md)
 
+## Download
+
+Todo push gera três pacotes no CI — pegue na aba **Actions**, na run mais recente, em *Artifacts*:
+
+| artefato | o que é |
+|---|---|
+| `Il2CppDumper-win-x64-standalone` | `.exe` único, ~68 MB, roda no Windows **sem .NET instalado** |
+| `Il2CppDumper-win-x64` | `.exe` único, ~1 MB, precisa do runtime .NET 8 |
+| `Il2CppDumper-portable` | `dotnet Il2CppDumper.dll`, qualquer SO com .NET 8 |
+
+Cada pacote já vem com `config.json`, os sidecars de `ffpatches/`, o `tools/` e os READMEs.
+Subir uma tag `v*` também publica tudo como Release do GitHub.
+
 ## Resultado
 
 Build OB do Free Fire, metadata v31. `dump.cs` comparado linha a linha com o gerado a partir de um

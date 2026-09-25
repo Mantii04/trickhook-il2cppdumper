@@ -1,20 +1,102 @@
 name: build
+
 on:
   push:
     branches: [ main, master ]
+    tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  PROJ: Il2CppDumper/Il2CppDumper.csproj
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - run: dotnet build Il2CppDumper/Il2CppDumper.csproj -c Release -f net8.0
+
+      # .exe unico que roda em Windows sem nenhum .NET instalado (~68 MB).
+      # Sem trimming: o Il2CppDumper usa reflexao pra ler os [Version] dos
+      # structs de metadata, e o trimmer corta isso.
+      - name: publish win-x64 standalone
+        run: >
+          dotnet publish $PROJ -c Release -f net8.0
+          -r win-x64 --self-contained true
+          -p:PublishSingleFile=true
+          -p:PublishTrimmed=false
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o publish/Il2CppDumper-win-x64-standalone
+
+      # .exe unico pequeno (~1 MB), exige o runtime .NET 8 na maquina.
+      - name: publish win-x64
+        run: >
+          dotnet publish $PROJ -c Release -f net8.0
+          -r win-x64 --self-contained false
+          -p:PublishSingleFile=true
+          -o publish/Il2CppDumper-win-x64
+
+      # dotnet Il2CppDumper.dll em qualquer SO com .NET 8.
+      - name: publish portable
+        run: >
+          dotnet publish $PROJ -c Release -f net8.0
+          -o publish/Il2CppDumper-portable
+
+      # Cada pacote leva as ferramentas e os sidecars da janela 0.
+      # O ffpatches/ ja vem do csproj; aqui entram tools e docs.
+      - name: bundle tools and docs
+        run: |
+          for d in publish/*/; do
+            cp -r tools "$d"
+            cp README.md README.pt-BR.md LICENSE "$d"
+          done
+          echo "--- conteudo ---"
+          for d in publish/*/; do echo "$d"; ls -la "$d"; done
+
+      - name: smoke test
+        run: |
+          cd publish/Il2CppDumper-portable
+          out=$(dotnet Il2CppDumper.dll 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "usage:" || { echo "binario nao subiu"; exit 1; }
+
       - uses: actions/upload-artifact@v4
         with:
-          name: Il2CppDumper-net8
-          path: Il2CppDumper/bin/Release/net8.0/
+          name: Il2CppDumper-win-x64-standalone
+          path: publish/Il2CppDumper-win-x64-standalone/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Il2CppDumper-win-x64
+          path: publish/Il2CppDumper-win-x64/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Il2CppDumper-portable
+          path: publish/Il2CppDumper-portable/
+          if-no-files-found: error
+
+      # Numa tag v*, empacota e publica uma Release.
+      - name: package for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd publish
+          for d in */; do (cd "$d" && zip -qr "../${d%/}.zip" .); done
+          ls -la *.zip
+
+      - name: create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" publish/*.zip --generate-notes

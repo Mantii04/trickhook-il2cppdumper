@@ -20,6 +20,19 @@ Dumping...
 Done!
 ```
 
+## Download
+
+Every push builds three packages on CI — grab one from the **Actions** tab, newest run, *Artifacts*:
+
+| artifact | what it is |
+|---|---|
+| `Il2CppDumper-win-x64-standalone` | single `.exe`, ~68 MB, runs on Windows with **no .NET installed** |
+| `Il2CppDumper-win-x64` | single `.exe`, ~1 MB, needs the .NET 8 runtime |
+| `Il2CppDumper-portable` | `dotnet Il2CppDumper.dll`, any OS with .NET 8 |
+
+Each package ships `config.json`, the `ffpatches/` sidecars, `tools/` and the READMEs.
+Pushing a `v*` tag also publishes them as a GitHub Release.
+
 ## Results
 
 Free Fire OB-era build, metadata v31. `dump.cs` compared line by line against the one produced from a
