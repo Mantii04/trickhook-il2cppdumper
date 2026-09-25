@@ -55,7 +55,7 @@ bool ff_unpack(ElfInfo& elf, std::vector<uint8_t>& buf, const LogFn& log) {
         }
     }
     if (desc_off == SIZE_MAX) {
-        // No packer descriptor — already plaintext.
+        log("  no packer descriptor found (0x12345678) — .so assumed already plaintext");
         return true;
     }
     log("Detected packed ELF (stub_decrypt_elf)");
